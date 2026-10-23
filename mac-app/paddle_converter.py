@@ -4,7 +4,7 @@ import math
 import re
 import shutil
 import argparse
-from contextlib import closing
+from contextlib import closing, contextmanager
 import base64
 import io
 import json
@@ -17,6 +17,29 @@ import sys
 import time
 import urllib.request
 
+PAGE_TIMEOUT = 90
+PREPARATION_TIMEOUT = 60
+
+
+@contextmanager
+def operation_deadline(seconds=PAGE_TIMEOUT):
+    def expired(*_):
+        raise TimeoutError('本页识别超时，已跳过并保留原图。')
+    previous = signal.signal(signal.SIGALRM, expired)
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, seconds)
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+        if previous_timer[0]:
+            signal.setitimer(signal.ITIMER_REAL, max(.001, previous_timer[0] - (time.monotonic()-started)), previous_timer[1])
+
+
+def text_issue(text):
+    return '识别文字含异常替代字符，需校对。' if '\ufffd' in text else None
+
 
 def recognized_text(response):
     choice = response['choices'][0]
@@ -25,6 +48,8 @@ def recognized_text(response):
         raise ValueError('本页识别输出达到上限，需校对。')
     if not text:
         raise ValueError('本页未识别到文字，已保留页面供检查。')
+    if text_issue(text):
+        raise ValueError(text_issue(text))
     return text
 
 
@@ -212,6 +237,61 @@ def atomic_json(path, value):
     temporary.replace(path)
 
 
+def page_markdown(index, result):
+    if not result.get('error'):
+        return result['markdown']
+    reason = result['error'].replace('，已停止，未生成不完整电子书。', '，需校对。')
+    pictures = '\n\n'.join(f'![PDF 第 {index+1} 页原图](images/{name})' for name in result['files'])
+    return f'> **需校对：PDF 第 {index+1} 页**。{reason}\n\n{pictures}'
+
+
+def validate_epub(epub, results, total_pages):
+    import zipfile
+    import posixpath
+    import zlib
+    from urllib.parse import unquote
+    from xml.etree import ElementTree
+    if set(results) != set(range(total_pages)):
+        raise RuntimeError('校验失败：PDF 页面记录不完整。')
+    with zipfile.ZipFile(epub) as archive:
+        if archive.testzip() is not None:
+            raise RuntimeError('校验失败：EPUB 文件损坏。')
+        names = set(archive.namelist())
+        if (archive.infolist()[0].filename != 'mimetype' or archive.infolist()[0].compress_type != zipfile.ZIP_STORED
+                or archive.read('mimetype') != b'application/epub+zip'):
+            raise RuntimeError('校验失败：EPUB 格式标记不正确。')
+        for name in names:
+            if name.endswith(('.xml', '.xhtml', '.opf', '.ncx')):
+                try:
+                    root = ElementTree.fromstring(archive.read(name))
+                except ElementTree.ParseError as failure:
+                    raise RuntimeError(f'校验失败：{name} 的正文结构异常。') from failure
+                for node in root.iter():
+                    ref = node.attrib.get('src') or (node.attrib.get('href') if node.tag.endswith('item') else None)
+                    if ref and not ref.startswith(('http:', 'https:', 'data:')):
+                        target = posixpath.normpath(posixpath.join(posixpath.dirname(name), unquote(ref.split('#')[0])))
+                        if target not in names:
+                            raise RuntimeError(f'校验失败：缺少图片或资源 {ref}。')
+        images = {name for result in results.values() for name in result['files']}
+        for name in images:
+            target = 'OPS/images/' + name
+            source = epub.parent/'images'/name
+            if target not in names or not source.is_file():
+                raise RuntimeError(f'校验失败：缺少图片 {name}。')
+            from PIL import Image
+            with Image.open(source) as picture:
+                copied_without_changes = source.suffix.lower() == '.png' and max(picture.size) <= 1800
+            if copied_without_changes and archive.getinfo(target).CRC != zlib.crc32(source.read_bytes()):
+                raise RuntimeError(f'校验失败：图片 {name} 与原图不一致。')
+        if (epub.parent/'content.md').read_text() != '\n\n---\n\n'.join(page_markdown(i, results[i]) for i in range(total_pages)):
+            raise RuntimeError('校验失败：PDF 页序与汇总正文不一致。')
+        chapter = ElementTree.fromstring(archive.read('OPS/s00000-content.xhtml'))
+        actual_images = [Path(node.attrib['src']).name for node in chapter.iter() if node.tag.endswith('img')]
+        if actual_images != [name for i in range(total_pages) for name in results[i]['files']]:
+            raise RuntimeError('校验失败：图片顺序与 PDF 页序不一致。')
+    return {'status': 'passed', 'pages': total_pages, 'images': len(images)}
+
+
 def initialize_preparation(pdf, cache, decorations):
     import pypdfium2 as pdfium
     global preparation_doc, preparation_cache, preparation_decorations
@@ -245,7 +325,6 @@ def prepare_page(index):
 def convert(pdf, output, title, author, language, resources, retry_failed=False):
     import pypdfium2 as pdfium
     import fcntl
-    from concurrent.futures import ProcessPoolExecutor
     import multiprocessing
     pdf, output, resources = Path(pdf), Path(output), Path(resources)
     if not pdf.is_file() or pdf.suffix.lower() != '.pdf':
@@ -281,6 +360,10 @@ def convert(pdf, output, title, author, language, resources, retry_failed=False)
             path = cache / 'page-results' / f'{index+1:05d}.json'
             try:
                 result = json.loads(path.read_text())
+                if not result.get('error') and text_issue(result.get('raw_text', result['markdown'])):
+                    result['error'] = text_issue(result.get('raw_text', result['markdown']))
+                    result['error_type'] = 'ocr_quality'
+                    atomic_json(path, result)
                 if retry_failed and result.get('error'):
                     continue
                 if all((cache / 'images' / name).is_file() for name in result['files']):
@@ -289,11 +372,23 @@ def convert(pdf, output, title, author, language, resources, retry_failed=False)
                 continue
         state = {'source': str(pdf), 'source_sha256': digest.hexdigest(), 'cache': str(cache),
                  'total_pages': count, 'segments': [[a+1,b] for a,b in segments],
-                 'completed': len(results), 'cache_hits': len(results), 'status': 'running', 'version': CACHE_VERSION}
+                 'completed': len(results), 'cache_hits': len(results), 'status': 'running', 'version': CACHE_VERSION,
+                 'stage': 'planning', 'current_page': None, 'current_part': None, 'page_started_at': time.time()}
         started = time.monotonic()
-        def status(value):
+        def status(value, **changes):
+            state.update(changes)
             state.update(status=value, completed=len(results), elapsed_seconds=round(time.monotonic()-started,1),
                          review_pages=[i+1 for i in sorted(results) if results[i].get('error')])
+            progress = []
+            for number, (first, last) in enumerate(segments, 1):
+                completed = sum(i in results for i in range(first, last))
+                reviews = sum(bool(results[i].get('error')) for i in range(first, last) if i in results)
+                part_status = ('review' if reviews else 'complete') if completed == last-first else 'waiting'
+                if state['current_part'] == number and completed < last-first:
+                    part_status = 'paused' if value == 'paused' else 'processing'
+                progress.append({'number': number, 'first': first+1, 'last': last, 'completed': completed,
+                                 'review_count': reviews, 'status': part_status})
+            state['segment_progress'] = progress
             atomic_json(folder / '任务状态.json', state)
             atomic_json(cache / 'job.json', state)
         status('running')
@@ -302,38 +397,77 @@ def convert(pdf, output, title, author, language, resources, retry_failed=False)
         pool = None
         pending = {}
         ocr = LocalOCR(resources, folder)
+        live = folder / '转换中.md'
+        live.write_text('', encoding='utf-8')
+        def append_live(index, result):
+            with live.open('a', encoding='utf-8') as document:
+                document.write(('\n\n---\n\n' if index else '') + page_markdown(index, result))
+        def new_pool():
+            return multiprocessing.get_context('spawn').Pool(processes=1, initializer=initialize_preparation,
+                initargs=(str(pdf), str(cache), decorations))
         def submit_next():
             index = next(missing, None)
             if index is not None:
-                pending[index] = pool.submit(prepare_page, index)
+                pending[index] = pool.apply_async(prepare_page, (index,))
+        def restart_preparation():
+            nonlocal pool, missing
+            remaining = sorted(pending) + list(missing)
+            pool.terminate(); pool.join()
+            pending.clear()
+            missing = iter(remaining)
+            pool = new_pool()
+            submit_next(); submit_next()
         try:
             if len(results) < count:
                 # PDFium runs in its own process: it is unsafe to render PDF pages in concurrent threads.
-                pool = ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context('spawn'),
-                    initializer=initialize_preparation, initargs=(str(pdf), str(cache), decorations))
+                pool = new_pool()
                 submit_next()
                 submit_next()
             for part, (first, last) in enumerate(segments, 1):
                 for index in range(first, last):
                     if index in results:
+                        append_live(index, results[index])
                         continue
                     page_started = time.monotonic()
+                    status('running', stage='preparing', current_part=part, current_page=index+1, page_started_at=time.time())
                     print(f'正在处理第 {part}/{len(segments)} 段，第 {index+1}/{count} 页', flush=True)
-                    prepared = pending.pop(index).result()
-                    submit_next()
                     error = None
-                    if prepared['blank']:
+                    error_type = None
+                    try:
+                        prepared = pending.pop(index).get(timeout=PREPARATION_TIMEOUT)
+                        submit_next()
+                    except Exception as failure:
+                        if isinstance(failure, OSError) and failure.errno in (13, 28):
+                            raise
+                        error = '页面渲染超时' if isinstance(failure, multiprocessing.TimeoutError) else f'页面渲染异常：{failure}'
+                        error_type = 'render_error'
+                        restart_preparation()
+                        image = cache/'images'/f'page-{index+1:05d}.png'
+                        pictures = ''
+                        if image.is_file():
+                            from PIL import Image
+                            try:
+                                with Image.open(image) as source:
+                                    source.verify()
+                                pictures = f'\n\n![第 {index+1} 页原图](images/{image.name})'
+                            except (OSError, ValueError):
+                                pass
+                        prepared = {'text': '', 'blank': False, 'scanned': False, 'pictures': pictures}
+                        print(f'第 {index+1} 页待校对，自动跳过：{error}', flush=True)
+                    if error:
+                        text = ''
+                    elif prepared['blank']:
                         text = '[空白页]'
                     elif prepared['scanned']:
+                        status('running', stage='recognizing')
                         try:
-                            try:
-                                text = ocr.read(Path(prepared['image']))
-                            except OSError:
-                                ocr.close()
+                            with operation_deadline():
                                 text = ocr.read(Path(prepared['image']))
                         except (ValueError, OSError) as failure:
                             error = str(failure)
+                            error_type = 'ocr_timeout' if isinstance(failure, TimeoutError) else 'ocr_error'
                             text = ''
+                            ocr.close()
                             print(f'第 {index+1} 页待校对，已保留原图并继续：{error}', flush=True)
                     else:
                         text = prepared['text']
@@ -341,33 +475,51 @@ def convert(pdf, output, title, author, language, resources, retry_failed=False)
                     text = raw_text + prepared['pictures']
                     files = re.findall(r'!\[[^\]]*\]\(images/([^/)]+)\)', text)
                     result = {'markdown': text, 'raw_text': raw_text, 'files': files, 'error': error,
-                              'seconds': round(time.monotonic()-page_started,2)}
+                              'error_type': error_type, 'seconds': round(time.monotonic()-page_started,2)}
                     atomic_json(cache / 'page-results' / f'{index+1:05d}.json', result)
                     results[index] = result
+                    append_live(index, result)
                     status('running')
                     print(f'已完成 {index+1}/{count} 页，本页 {result["seconds"]:.1f} 秒', flush=True)
-                (folder / f'part-{part:02d}.md').write_text('\n\n---\n\n'.join(results[i]['markdown'] for i in range(first,last)), encoding='utf-8')
-            status('assembling')
+                (folder / f'part-{part:02d}.md').write_text('\n\n---\n\n'.join(page_markdown(i, results[i]) for i in range(first,last)), encoding='utf-8')
+                ocr.close()
+                if part < len(segments) and pool is not None and len(results) < count:
+                    restart_preparation()
+                print(f'第 {part}/{len(segments)} 段已保存，自动继续。', flush=True)
+            status('assembling', stage='packaging')
         except BaseException:
             status('paused')
             raise
         finally:
             ocr.close()
             if pool:
-                pool.shutdown(wait=True, cancel_futures=True)
-        (folder / 'content.md').write_text('\n\n---\n\n'.join(results[i]['markdown'] for i in range(count)), encoding='utf-8')
+                pool.terminate(); pool.join()
+        shutil.copyfile(live, folder / 'content.md')
         (folder / 'images').mkdir(exist_ok=True)
         for name in {name for result in results.values() for name in result['files']}:
             shutil.copyfile(cache / 'images' / name, folder / 'images' / name)
-        warnings = [f'第 {i+1} 页：{results[i]["error"].replace("，已停止，未生成不完整电子书。", "，需校对。")} 已保留原图。' for i in sorted(results) if results[i].get('error')]
+        reviews = [{'pdf_page': i+1, 'reason': results[i]['error'].replace('，已停止，未生成不完整电子书。', '，需校对。'),
+                    'type': results[i].get('error_type') or 'review', 'image_preserved': bool(results[i]['files'])}
+                   for i in sorted(results) if results[i].get('error')]
+        warnings = [f'PDF 第 {r["pdf_page"]} 页：{r["reason"]} ' + ('已保留原图。' if r['image_preserved'] else '未能提取原图，请对照原 PDF。') for r in reviews]
         (folder / '需校对页面.txt').write_text('\n'.join(warnings), encoding='utf-8')
         print('正在汇总分段并生成 EPUB…', flush=True)
         try:
             epub = package_book(folder, pdf, title, author, language, resources)
+            status('validating', stage='validating')
+            print('正在校验 PDF 页数、图片和 EPUB 结构…', flush=True)
+            validation = validate_epub(epub, results, count)
+            report = {'total_pages': count, 'normal_pages': count-len(reviews), 'review_pages': reviews,
+                      'segments': state['segments'], 'validation': validation}
+            atomic_json(folder/'转换报告.json', report)
+            (folder/'转换报告.md').write_text(f'# 转换报告\n\nPDF 共 {count} 页，分 {len(segments)} 段，正常处理 {count-len(reviews)} 页，需校对 {len(reviews)} 页。\n\n'
+                '页码均指原 PDF 物理页，从封面第 1 页起。异常页已自动跳过，不会阻止后续页面处理。\n\n'
+                + ('\n'.join('- '+warning for warning in warnings) if warnings else '未检测到处理异常。')
+                + f'\n\n自动校验通过：{count} 条页面记录、{validation["images"]} 张图片及 EPUB 结构完整。\n', encoding='utf-8')
         except BaseException:
             status('packaging_failed')
             raise
-        status('complete')
+        status('complete', stage='complete', validation=validation)
         print(f'转换完成：{count} 页，{len(segments)} 段，待校对 {len(warnings)} 页，共 {state["elapsed_seconds"]} 秒。', flush=True)
         return epub
 

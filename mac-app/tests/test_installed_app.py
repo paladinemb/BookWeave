@@ -18,7 +18,7 @@ class InstalledAppTest(unittest.TestCase):
         self.assertIn('PASS', result.stdout)
 
     def test_self_contained_python_and_converter(self):
-        result=subprocess.run([str(RESOURCES/'python-runtime/bin/python3.12'), '-I', '-c',
+        result=subprocess.run([str(RESOURCES/'python-runtime/bin/python3.12'), '-B', '-I', '-c',
             'import sys,pypdfium2,markdown,PIL; print(sys.prefix)'],capture_output=True,text=True)
         self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
         self.assertEqual(result.stdout.strip(), str(RESOURCES/'python-runtime'))
@@ -33,7 +33,7 @@ class InstalledAppTest(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stderr)
 
     def test_runner_accepts_existing_process_group(self):
-        result=subprocess.run([str(RESOURCES/'python-runtime/bin/python3.12'),'-I',
+        result=subprocess.run([str(RESOURCES/'python-runtime/bin/python3.12'),'-B','-I',
             str(RESOURCES/'paddle_converter.py'),'--help'],capture_output=True,text=True,start_new_session=True)
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
         self.assertIn('BookWeave',result.stdout)

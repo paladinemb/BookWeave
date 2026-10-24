@@ -16,6 +16,8 @@ cp "$root/assets/AppIcon.icns" "$output/Contents/Resources/AppIcon.icns"
 cp "$root/mac-app/paddle_converter.py" "$output/Contents/Resources/paddle_converter.py"
 cp "$root/pdf2epub/modules/"*.py "$output/Contents/Resources/pdf2epub/modules/"
 cp "$root/pdf2epub/LICENSE" "$output/Contents/Resources/pdf2epub/LICENSE"
+cp "$root/THIRD_PARTY_NOTICES.md" "$root/LICENSE" "$output/Contents/Resources/"
+"$output/Contents/Resources/python-runtime/bin/python3.12" -B -I "$root/scripts/prune_resources.py" "$output/Contents/Resources"
 cache="$(mktemp -d)"
 trap 'rm -rf "$cache"' EXIT
 xcrun swiftc -parse-as-library -O -target arm64-apple-macos14.0 -module-cache-path "$cache" "$root/mac-app/PDFtoEPUB.swift" -o "$output/Contents/MacOS/BookWeave"

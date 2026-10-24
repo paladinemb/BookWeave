@@ -9,6 +9,7 @@ A native macOS app that turns Chinese and English PDFs into editable EPUBs using
 ## 功能
 
 - 原生 SwiftUI 界面，文件在本机处理。
+- 构建时精简无用运行资源，保留主识别模型、必需视觉模型及服务端依赖。
 - PaddleOCR-VL-1.6 GGUF，通过 llama.cpp 使用 Apple GPU。
 - 每段最多 300 页并平均分配：1000 页分 4 段，800 页分 3 段；最终汇总为一个 EPUB。
 - 逐页缓存、断点续转，界面显示各段页码范围、进度及异常数量。

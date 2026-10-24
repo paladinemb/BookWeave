@@ -36,6 +36,8 @@ bash scripts/build_app.sh /Applications/BookWeave.app/Contents/Resources
 
 生成 `dist/BookWeave.app`。目标已存在时构建会停止，避免覆盖；也可用第二个参数指定一个新的 `.app` 路径。
 
+构建时自动清理下载归档、Python 开发和旧 GUI 资源，并按 `llama-server` 的动态库依赖保留推理运行环境；两份 OCR 权重、所需动态库与许可证均保留。仅在没有其他内置二进制直接依赖时移除独立的 `libpython` 副本。打包精简测试也包含在下述测试命令中。
+
 ```sh
 dist/BookWeave.app/Contents/MacOS/BookWeave --self-test
 BOOKWEAVE_APP="$PWD/dist/BookWeave.app" python -B -m unittest discover -s mac-app/tests

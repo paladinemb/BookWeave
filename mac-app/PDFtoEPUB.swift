@@ -56,7 +56,8 @@ struct ConversionProgress: Decodable {
     }
     var stageLabel: String {
         switch stage {
-        case "preparing": return "正在准备页面"
+        case "cleaning": return "正在检查重复页边装饰"
+        case "preparing": return "正在清理页边并准备高清页面"
         case "recognizing": return "正在识别文字，异常页会自动跳过"
         case "packaging": return "正在汇总分段并生成 EPUB"
         case "validating": return "正在自动校验页数、图片和电子书结构"

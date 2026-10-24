@@ -191,6 +191,113 @@ def repeated_decorations(doc):
     return {key for key, count in counts.items() if count >= max(3, len(doc)*.1)}
 
 
+def margin_graphics(image):
+    from PIL import Image
+    gray = image.convert('L')
+    gray.thumbnail((900, 900))
+    width, height = gray.size
+    dx, dy = max(1, int(width*.12)), max(1, int(height*.12))
+    candidates = []
+    seen = set()
+    for side, bounds in [('left', (0, 0, dx, height)), ('right', (width-dx, 0, width, height)),
+                         ('top', (0, 0, width, dy)), ('bottom', (0, height-dy, width, height))]:
+        band = gray.crop(bounds)
+        bw, bh = band.size
+        dark = {i for i, value in enumerate(band.tobytes()) if value < 180}
+        band.close()
+        while dark:
+            first = dark.pop()
+            pending = [first]
+            xs, ys, pixels = first % bw, first // bw, 0
+            left = right = xs; top = bottom = ys
+            while pending:
+                index = pending.pop(); x, y = index % bw, index // bw
+                pixels += 1
+                left, right, top, bottom = min(left,x), max(right,x), min(top,y), max(bottom,y)
+                neighbors = (index-1 if x else -1, index+1 if x+1 < bw else -1,
+                             index-bw if y else -1, index+bw if y+1 < bh else -1)
+                for neighbor in neighbors:
+                    if neighbor in dark:
+                        dark.remove(neighbor); pending.append(neighbor)
+            w, h = right-left+1, bottom-top+1
+            # Small glyphs and thin rules are text, page numbers or chart borders, not decoration evidence.
+            if min(w,h) < 4 or (w < width*.035 and h < height*.035) or w*h > width*height*.02 or pixels/(w*h) < .35:
+                continue
+            if side in ('top', 'bottom') and h < height*.018:
+                continue
+            box = (left+bounds[0], top+bounds[1], right+bounds[0]+1, bottom+bounds[1]+1)
+            if ((side == 'left' and box[2] > width*.105) or (side == 'right' and box[0] < width*.895)
+                    or (side == 'top' and box[3] > height*.105) or (side == 'bottom' and box[1] < height*.895) or box in seen):
+                continue
+            seen.add(box)
+            thumb = gray.crop(box).resize((8, 8), Image.Resampling.BOX)
+            signature = sum((value < 180) << i for i, value in enumerate(thumb.tobytes()))
+            thumb.close()
+            candidates.append({'side': side, 'width': w/width, 'height': h/height,
+                               'signature': signature, 'box': [box[0]/width, box[1]/height, box[2]/width, box[3]/height]})
+    gray.close()
+    return candidates
+
+
+def same_margin_graphic(item, pattern):
+    return (item['side'] == pattern['side'] and
+            abs(item['width']/pattern['width']-1) < .25 and abs(item['height']/pattern['height']-1) < .25 and
+            (item['signature'] ^ pattern['signature']).bit_count() <= 8)
+
+
+def raster_decorations(doc):
+    if len(doc) < 3:
+        return []
+    # Sample across the book; confirmation needs different pages, never repeated shapes on one page.
+    indices = sorted({round(i*(len(doc)-1)/31) for i in range(32)}) if len(doc) > 32 else list(range(len(doc)))
+    groups = []
+    for index in indices:
+        with closing(doc[index]) as page:
+            bitmap = page.render(scale=min(1.5, 900/max(page.get_size())))
+            image = bitmap.to_pil()
+            for candidate in margin_graphics(image):
+                group = next((g for g in groups if same_margin_graphic(candidate, g[0])), None)
+                if group is None:
+                    groups.append((candidate, {index}))
+                else:
+                    group[1].add(index)
+            image.close(); bitmap.close()
+    return [pattern for pattern, pages in groups if len(pages) >= max(3, math.ceil(len(indices)*.15))]
+
+
+def raster_decorations_from_pdf(pdf):
+    import pypdfium2 as pdfium
+    with closing(pdfium.PdfDocument(pdf)) as doc:
+        return raster_decorations(doc)
+
+
+def scan_raster_decorations(pdf):
+    import multiprocessing
+    pool = multiprocessing.get_context('spawn').Pool(processes=1)
+    try:
+        return pool.apply_async(raster_decorations_from_pdf, (str(pdf),)).get(timeout=PREPARATION_TIMEOUT), None
+    except Exception as failure:
+        reason = '超时' if isinstance(failure, multiprocessing.TimeoutError) else str(failure)
+        return [], f'扫描页边装饰检查未完成（{reason}），已保留不确定图形并继续转换。'
+    finally:
+        pool.terminate(); pool.join()
+
+
+def remove_margin_decorations(image, patterns):
+    from PIL import ImageDraw
+    cleaned = image.convert('RGB')
+    draw = ImageDraw.Draw(cleaned)
+    removed = 0
+    if patterns:
+        for item in margin_graphics(image):
+            if any(same_margin_graphic(item, pattern) for pattern in patterns):
+                x0, y0, x1, y1 = item['box']
+                draw.rectangle((max(0, int(x0*image.width)-2), max(0, int(y0*image.height)-2),
+                                min(image.width-1, math.ceil(x1*image.width)+2), min(image.height-1, math.ceil(y1*image.height)+2)), fill='white')
+                removed += 1
+    return cleaned, removed
+
+
 def preserve_pictures(page, folder, number, scanned, decorations=frozenset()):
     import pypdfium2 as pdfium
     import shutil
@@ -228,7 +335,7 @@ def preserve_pictures(page, folder, number, scanned, decorations=frozenset()):
 
 
 
-CACHE_VERSION = 'paddleocr-vl-1.6-b11814-batched-v1'
+CACHE_VERSION = 'paddleocr-vl-1.6-b11814-clean-300dpi-v2'
 
 
 def atomic_json(path, value):
@@ -294,10 +401,11 @@ def validate_epub(epub, results, total_pages):
 
 def initialize_preparation(pdf, cache, decorations):
     import pypdfium2 as pdfium
-    global preparation_doc, preparation_cache, preparation_decorations
+    global preparation_doc, preparation_cache, preparation_decorations, preparation_raster_decorations
     preparation_doc = pdfium.PdfDocument(pdf)
     preparation_cache = Path(cache)
     preparation_decorations = decorations
+    preparation_raster_decorations = json.loads((preparation_cache/'raster-decorations.json').read_text())['patterns']
 
 
 def prepare_page(index):
@@ -307,19 +415,34 @@ def prepare_page(index):
             text = tp.get_text_bounded().strip()
         scanned = sum(c.isalnum() for c in text) < 30
         blank = False
+        preprocessing = None
         image_path = folder / 'images' / f'page-{index+1:05d}.png'
         if scanned:
-            bitmap = page.render(scale=min(2.0, 1800 / max(page.get_size())))
-            image = bitmap.to_pil()
+            scale = min(300/72, 5000/max(page.get_size()))
+            bitmap = page.render(scale=scale)
+            source = bitmap.to_pil()
+            image, removed = remove_margin_decorations(source, preparation_raster_decorations)
+            source.close(); bitmap.close()
             gray = image.convert('L')
             histogram = gray.histogram()
             blank = sum(histogram[:200]) / (gray.width * gray.height) < 0.001
+            ink = gray.point(lambda value: 255 if value < 245 else 0)
+            box = ink.getbbox()
+            ink.close()
             gray.close()
+            original_size = image.size
+            if box:
+                pad = max(8, round(min(image.size)*.01))
+                box = (max(0,box[0]-pad), max(0,box[1]-pad), min(image.width,box[2]+pad), min(image.height,box[3]+pad))
+                cropped = image.crop(box)
+                image.close(); image = cropped
+            preprocessing = {'removed_margin_items': removed, 'source_pixels': list(original_size),
+                             'crop_box': box, 'ocr_pixels': list(image.size), 'ocr_dpi': round(scale*72)}
             image.save(image_path)
             image.close()
-            bitmap.close()
         pictures = '' if blank else preserve_pictures(page, folder, index+1, scanned, preparation_decorations)
-    return {'text': text, 'scanned': scanned, 'blank': blank, 'image': str(image_path), 'pictures': pictures}
+    return {'text': text, 'scanned': scanned, 'blank': blank, 'image': str(image_path), 'pictures': pictures,
+            'preprocessing': preprocessing}
 
 
 def convert(pdf, output, title, author, language, resources, retry_failed=False):
@@ -392,6 +515,15 @@ def convert(pdf, output, title, author, language, resources, retry_failed=False)
             atomic_json(folder / '任务状态.json', state)
             atomic_json(cache / 'job.json', state)
         status('running')
+        raster_file = cache/'raster-decorations.json'
+        if not raster_file.exists():
+            status('running', stage='cleaning')
+            print('正在检查扫描图中的重复页边装饰…', flush=True)
+            patterns, warning = scan_raster_decorations(pdf)
+            atomic_json(raster_file, {'patterns': patterns, 'warning': warning})
+        preprocessing_warning = json.loads(raster_file.read_text())['warning']
+        if preprocessing_warning:
+            print(preprocessing_warning, flush=True)
         print(f'正在分段：共 {count} 页，{len(segments)} 段；已缓存 {len(results)} 页。', flush=True)
         missing = iter(i for i in range(count) if i not in results)
         pool = None
@@ -475,7 +607,8 @@ def convert(pdf, output, title, author, language, resources, retry_failed=False)
                     text = raw_text + prepared['pictures']
                     files = re.findall(r'!\[[^\]]*\]\(images/([^/)]+)\)', text)
                     result = {'markdown': text, 'raw_text': raw_text, 'files': files, 'error': error,
-                              'error_type': error_type, 'seconds': round(time.monotonic()-page_started,2)}
+                              'error_type': error_type, 'seconds': round(time.monotonic()-page_started,2),
+                              'preprocessing': prepared.get('preprocessing')}
                     atomic_json(cache / 'page-results' / f'{index+1:05d}.json', result)
                     results[index] = result
                     append_live(index, result)
@@ -509,11 +642,16 @@ def convert(pdf, output, title, author, language, resources, retry_failed=False)
             status('validating', stage='validating')
             print('正在校验 PDF 页数、图片和 EPUB 结构…', flush=True)
             validation = validate_epub(epub, results, count)
+            preprocessing = {'cleaned_pages': sum(bool((r.get('preprocessing') or {}).get('removed_margin_items')) for r in results.values()),
+                             'removed_margin_items': sum((r.get('preprocessing') or {}).get('removed_margin_items', 0) for r in results.values()),
+                             'warning': preprocessing_warning}
             report = {'total_pages': count, 'normal_pages': count-len(reviews), 'review_pages': reviews,
-                      'segments': state['segments'], 'validation': validation}
+                      'segments': state['segments'], 'validation': validation, 'preprocessing': preprocessing}
             atomic_json(folder/'转换报告.json', report)
             (folder/'转换报告.md').write_text(f'# 转换报告\n\nPDF 共 {count} 页，分 {len(segments)} 段，正常处理 {count-len(reviews)} 页，需校对 {len(reviews)} 页。\n\n'
                 '页码均指原 PDF 物理页，从封面第 1 页起。异常页已自动跳过，不会阻止后续页面处理。\n\n'
+                + f'已清理 {preprocessing["cleaned_pages"]} 页的 {preprocessing["removed_margin_items"]} 处重复页边装饰；扫描页使用最高 300 DPI 高清输入，参考图已清边并裁去空白。原 PDF 未修改。\n\n'
+                + ((preprocessing_warning+'\n\n') if preprocessing_warning else '')
                 + ('\n'.join('- '+warning for warning in warnings) if warnings else '未检测到处理异常。')
                 + f'\n\n自动校验通过：{count} 条页面记录、{validation["images"]} 张图片及 EPUB 结构完整。\n', encoding='utf-8')
         except BaseException:

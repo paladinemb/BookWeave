@@ -16,3 +16,4 @@ runtime-resources/
 
 release-output/
 *.spec
+!fixtures/Install-scan.pdf

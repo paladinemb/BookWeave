@@ -6,6 +6,11 @@ on:
     paths:
       - mac-app/Info.plist
       - .github/workflows/release.yml
+      - release/**
+      - scripts/build_app.sh
+      - scripts/build_desktop.py
+      - scripts/prepare_release.py
+      - desktop/**
 env:
   PYTHONUTF8: '1'
   PYTHONDONTWRITEBYTECODE: '1'

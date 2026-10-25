@@ -25,6 +25,7 @@ struct SegmentProgress: Decodable, Identifiable {
 
 struct ConversionProgress: Decodable {
     struct Validation: Decodable { let status: String }
+    struct ActivePage: Decodable { let pdfPage: Int; let part: Int; let startedAt: Double; let stage: String }
     let totalPages: Int
     let completed: Int
     let cacheHits: Int
@@ -35,6 +36,9 @@ struct ConversionProgress: Decodable {
     let segmentProgress: [SegmentProgress]
     let stage: String?
     let validation: Validation?
+    var activePages: [ActivePage]? = nil
+    var concurrency: Int? = nil
+    var resourceMessage: String? = nil
     static func decode(_ data: Data) throws -> ConversionProgress {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -107,8 +111,9 @@ func selfTest() throws {
     precondition(ConversionProgress.preview(0).segmentProgress.isEmpty)
     let snapshot = try ConversionProgress.decode(Data("""
     {"total_pages":1027,"completed":57,"cache_hits":0,"current_page":58,"current_part":1,"page_started_at":1,
-    "review_pages":[57],"stage":"recognizing","segment_progress":[{"number":1,"first":1,"last":257,"completed":57,"review_count":1,"status":"processing"}]}
+    "active_pages":[{"pdf_page":58,"part":1,"started_at":1,"stage":"recognizing"},{"pdf_page":315,"part":2,"started_at":1,"stage":"recognizing"}],"concurrency":2,"review_pages":[57],"stage":"recognizing","segment_progress":[{"number":1,"first":1,"last":257,"completed":57,"review_count":1,"status":"processing"}]}
     """.utf8))
+    precondition(snapshot.activePages?.map(\.pdfPage) == [58,315] && snapshot.concurrency == 2)
     precondition(snapshot.currentPage == 58 && snapshot.reviewPages == [57] && snapshot.segmentProgress[0].label == "处理中")
     precondition(SegmentProgress(number: 1, first: 1, last: 257, completed: 257, reviewCount: 1, status: "review").label == "已完成 · 1 页需校对")
     print("PASS: metadata, output protection, segment planning and anomaly progress")
@@ -357,7 +362,10 @@ struct PDFtoEPUBApp: App {
                                 Text("共 \(progress.segmentProgress.count) 段").foregroundStyle(.secondary)
                             }
                             ProgressView(value: Double(progress.completed), total: Double(progress.totalPages))
-                            if model.running, let page = progress.currentPage, let part = progress.currentPart,
+                            if model.running, let pages = progress.activePages, !pages.isEmpty {
+                                Text(pages.map { "第 \($0.part) 段 · PDF 第 \($0.pdfPage) 页 · \(max(0, Int(Date().timeIntervalSince1970 - $0.startedAt))) 秒" }.joined(separator: "　|　"))
+                                    .font(.caption).monospacedDigit()
+                            } else if model.running, let page = progress.currentPage, let part = progress.currentPart,
                                progress.stage == "preparing" || progress.stage == "recognizing" {
                                 Text("第 \(part) 段 · PDF 第 \(page) 页 · 本页 \(model.pageElapsed) 秒")
                                     .font(.caption).monospacedDigit()
@@ -379,10 +387,13 @@ struct PDFtoEPUBApp: App {
                                 }
                             }.frame(height: min(CGFloat(progress.segmentProgress.count)*42, 168))
                             HStack {
-                                Text("复用 \(progress.cacheHits) 页 · 需校对 \(progress.reviewPages.count) 页")
+                                Text("\(progress.concurrency == 2 ? "双分段并行" : "单任务") · 复用 \(progress.cacheHits) 页 · 需校对 \(progress.reviewPages.count) 页")
                                 Spacer()
                                 if progress.validation?.status == "passed" { Text("自动校验通过").foregroundStyle(.green) }
                             }.font(.caption).foregroundStyle(.secondary)
+                            if let reason = progress.resourceMessage {
+                                Text(reason).font(.caption).foregroundStyle(.orange)
+                            }
                             Text("异常页自动跳过并标记，全部分段完成后自动校验。页码从原 PDF 封面起计。")
                                 .font(.caption).foregroundStyle(.secondary)
                         }.padding(8)

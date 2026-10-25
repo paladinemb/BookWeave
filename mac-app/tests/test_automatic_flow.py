@@ -1,5 +1,4 @@
 import json
-import signal
 import sys
 import tempfile
 import time
@@ -43,16 +42,6 @@ class AutomaticFlowTest(unittest.TestCase):
             self.assertEqual(len(report['review_pages']), 1)
             self.assertEqual(report['review_pages'][0]['pdf_page'], 1)
             self.assertEqual(report['review_pages'][0]['type'], 'ocr_quality')
-
-    def test_deadline_interrupts_a_blocked_operation_and_restores_signal(self):
-        self.assertTrue(callable(getattr(c, 'operation_deadline', None)), 'Missing absolute page deadline')
-        previous = signal.getsignal(signal.SIGALRM)
-        started = time.monotonic()
-        with self.assertRaisesRegex(TimeoutError, '超时'):
-            with c.operation_deadline(0.04):
-                time.sleep(1)
-        self.assertLess(time.monotonic() - started, 0.5)
-        self.assertEqual(signal.getsignal(signal.SIGALRM), previous)
 
     def test_page_57_is_skipped_once_marked_live_and_reported_after_validation(self):
         import pypdfium2 as p
@@ -148,7 +137,7 @@ class AutomaticFlowTest(unittest.TestCase):
             def read(image):
                 workers.append({process.pid for process in multiprocessing.active_children()})
                 return 'Editable text'
-            with patch.dict('os.environ', {'BOOKWEAVE_CACHE_DIR': str(root/'cache')}), patch.object(c.LocalOCR, 'read', side_effect=read):
+            with patch.dict('os.environ', {'BOOKWEAVE_CACHE_DIR': str(root/'cache')}), patch.object(c.LocalOCR, 'read', side_effect=read), patch.object(c, 'preferred_parallelism', return_value=1):
                 epub = c.convert(pdf, root/'out', 'Book', '', 'en', ROOT)
             self.assertEqual(len(workers), 2)
             self.assertTrue(workers[0] and workers[1])

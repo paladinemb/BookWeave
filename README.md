@@ -12,6 +12,7 @@ A native macOS app that turns Chinese and English PDFs into editable EPUBs using
 - 构建时精简无用运行资源，保留主识别模型、必需视觉模型及服务端依赖。
 - PaddleOCR-VL-1.6 GGUF，通过 llama.cpp 使用 Apple GPU。
 - 每段最多 300 页并平均分配：1000 页分 4 段，800 页分 3 段；最终汇总为一个 EPUB。
+- 仅超过 300 页的大 PDF 可同时处理两个不同分段，共享一个模型；内存或 CPU 占用过高时自动退回单任务。
 - 逐页缓存、断点续转，界面显示各段页码范围、进度及异常数量。
 - 文字版页面直接提取；扫描页识别与下一页准备重叠执行。
 - 保留正文图片和扫描页参考图，过滤多页重复的小型页边装饰。
@@ -24,7 +25,7 @@ A native macOS app that turns Chinese and English PDFs into editable EPUBs using
 
 运行环境为 **Apple Silicon Mac，macOS 14 或更新版本**。本仓库提供源码，模型权重和 Python/llama.cpp 运行时单独准备，详见 [构建说明](docs/BUILDING.md)。
 
-选择 PDF，填写书名和电子书语言，点击“开始／继续转换”。同一份 PDF 的已完成页面会自动复用，各段自动依次处理；异常页自动标记并跳过。每次输出保存到独立目录，避免覆盖已编辑的文件。
+选择 PDF，填写书名和电子书语言，点击“开始／继续转换”。同一份 PDF 的已完成页面会自动复用，各段自动处理；异常页自动标记并跳过。每次输出保存到独立目录，避免覆盖已编辑的文件。
 
 使用方法、缓存位置和图片处理规则见 [使用说明](docs/使用说明.md)。可选安装 [Sigil](https://sigil-ebook.com/) 编辑 EPUB。
 

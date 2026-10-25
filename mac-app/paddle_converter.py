@@ -4,7 +4,12 @@ import math
 import re
 import shutil
 import argparse
-from contextlib import closing, contextmanager
+from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from itertools import zip_longest
+import http.client
+import threading
+from urllib.parse import urlsplit
 import base64
 import io
 import json
@@ -21,20 +26,38 @@ PAGE_TIMEOUT = 90
 PREPARATION_TIMEOUT = 60
 
 
-@contextmanager
-def operation_deadline(seconds=PAGE_TIMEOUT):
-    def expired(*_):
-        raise TimeoutError('本页识别超时，已跳过并保留原图。')
-    previous = signal.signal(signal.SIGALRM, expired)
-    previous_timer = signal.setitimer(signal.ITIMER_REAL, seconds)
-    started = time.monotonic()
+def resource_sample(pid=None):
     try:
-        yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
-        if previous_timer[0]:
-            signal.setitimer(signal.ITIMER_REAL, max(.001, previous_timer[0] - (time.monotonic()-started)), previous_timer[1])
+        def command(*args):
+            return subprocess.check_output(args, text=True, timeout=2, stderr=subprocess.DEVNULL)
+        memory = int(command('/usr/sbin/sysctl', '-n', 'hw.memsize'))
+        cores = int(command('/usr/sbin/sysctl', '-n', 'hw.logicalcpu'))
+        free = float(re.search(r'free percentage: (\d+)%', command('/usr/bin/memory_pressure', '-Q')).group(1))
+        swap = re.search(r'used = ([\d.]+)([KMG])', command('/usr/sbin/sysctl', '-n', 'vm.swapusage'))
+        rss, cpu = command('/bin/ps', '-p', str(pid), '-o', 'rss=,%cpu=').split() if pid else ('0', '0')
+        return {'memory_bytes': memory, 'free_percent': free, 'swap_bytes': float(swap[1])*1024**('KMG'.index(swap[2])+1),
+                'rss_bytes': int(rss)*1024, 'cpu_machine_percent': float(cpu)/cores}
+    except (OSError, ValueError, AttributeError, TypeError, subprocess.SubprocessError):
+        return None
+
+
+def preferred_parallelism():
+    sample = resource_sample()
+    return 2 if sample and sample['memory_bytes'] >= 12*1024**3 and sample['free_percent'] >= 25 else 1
+
+
+def resource_limit_reason(sample, initial_swap, high_cpu_samples):
+    if sample is None:
+        return '无法读取资源占用，自动使用单任务'
+    if sample['free_percent'] < 15:
+        return '系统可用内存低于 15%'
+    if sample['rss_bytes'] > min(4*1024**3, sample['memory_bytes']*.25):
+        return '识别引擎内存达到保护上限'
+    if sample['swap_bytes']-initial_swap > 256*1024**2:
+        return '系统交换空间增加超过 256 MB'
+    if high_cpu_samples >= 5:
+        return 'CPU 持续高负载'
+    return None
 
 
 def text_issue(text):
@@ -96,11 +119,36 @@ def consume_ocr_stream(lines):
 
 
 class LocalOCR:
-    def __init__(self, resources, folder):
+    def __init__(self, resources, folder, parallelism=1):
         self.resources = resources
         self.folder = folder
         self.process = None
         self.log = None
+        self.parallelism = parallelism
+        self.limit_reason = None
+        self.metrics = None
+        self.start_lock = threading.Lock()
+        self.stopped = threading.Event()
+        self.monitor = None
+
+    def watch_resources(self):
+        initial_swap = self.initial_swap
+        high_cpu = 0
+        while not self.stopped.wait(1):
+            sample = resource_sample(self.process.pid)
+            self.metrics = sample
+            if sample:
+                if initial_swap is None:
+                    initial_swap = sample['swap_bytes']
+                high_cpu = high_cpu+1 if sample['cpu_machine_percent'] > 75 else 0
+            reason = resource_limit_reason(sample, initial_swap or 0, high_cpu)
+            if self.parallelism == 2 and reason:
+                self.limit_reason = reason
+                # Stop admission first; only critical pressure interrupts the two active requests.
+                if sample and (sample['free_percent'] < 10 or sample['rss_bytes'] > min(5*1024**3, sample['memory_bytes']*.32)):
+                    if self.process.poll() is None:
+                        self.process.terminate()
+                return
 
     def start(self):
         with socket.socket() as sock:
@@ -110,15 +158,27 @@ class LocalOCR:
         engine = self.resources / 'paddle-engine'
         models = engine / 'models'
         self.log = (self.folder / '识别引擎记录.txt').open('a')
+        baseline = resource_sample()
+        self.initial_swap = baseline['swap_bytes'] if baseline else None
+        if self.stopped.is_set():
+            raise OSError('识别引擎已停止。')
         self.process = subprocess.Popen([
             str(engine / 'runtime/llama-b11814/llama-server'),
             '-m', str(models / 'PaddleOCR-VL-1.6-GGUF.gguf'),
             '--mmproj', str(models / 'PaddleOCR-VL-1.6-GGUF-mmproj.gguf'),
             '--host', '127.0.0.1', '--port', str(port),
-            '-ngl', '99', '-c', '16384', '--parallel', '1', '--temp', '0',
+            '-ngl', '99', '-c', str(16384*self.parallelism), '--parallel', str(self.parallelism), '--temp', '0',
         ], stdout=self.log, stderr=subprocess.STDOUT)
-        for _ in range(180):
+        self.monitor = threading.Thread(target=self.watch_resources, daemon=True)
+        self.monitor.start()
+        for _ in range(90):
+            if self.stopped.is_set():
+                self.process.terminate()
+                self.process.wait(timeout=10)
+                raise OSError('识别引擎已停止。')
             if self.process.poll() is not None:
+                if self.limit_reason:
+                    raise OSError(self.limit_reason)
                 raise RuntimeError('识别引擎启动失败，请查看识别引擎记录。')
             try:
                 with urllib.request.urlopen(self.url + '/health', timeout=1) as r:
@@ -129,9 +189,12 @@ class LocalOCR:
         raise RuntimeError('识别引擎启动超时。')
 
     def read(self, image):
-        if self.process is None:
-            print('正在加载 PaddleOCR-VL-1.6（Apple GPU）…', flush=True)
-            self.start()
+        with self.start_lock:
+            if self.stopped.is_set():
+                raise OSError('识别引擎已停止。')
+            if self.process is None:
+                print('正在加载 PaddleOCR-VL-1.6（Apple GPU）…', flush=True)
+                self.start()
         if isinstance(image, Path):
             data = image.read_bytes()
         else:
@@ -143,12 +206,47 @@ class LocalOCR:
             {'type': 'text', 'text': 'OCR:'},
             {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + encoded}},
         ]}], 'repeat_penalty': 1.1, 'temperature': 0, 'max_tokens': 8192, 'stream': True}
-        request = urllib.request.Request(self.url + '/v1/chat/completions',
-            data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json'})
-        with urllib.request.urlopen(request, timeout=300) as response:
-            return consume_ocr_stream(response)
+        endpoint = urlsplit(self.url)
+        connection = http.client.HTTPConnection(endpoint.hostname, endpoint.port, timeout=PAGE_TIMEOUT)
+        expired = threading.Event()
+        transport = None
+        def cancel_request():
+            expired.set()
+            target = transport or connection.sock
+            if target is not None:
+                try:
+                    target.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+        timer = threading.Timer(PAGE_TIMEOUT, cancel_request)
+        timer.daemon = True
+        timer.start()
+        try:
+            connection.request('POST', '/v1/chat/completions', body=json.dumps(payload).encode(),
+                               headers={'Content-Type': 'application/json'})
+            transport = connection.sock
+            with connection.getresponse() as response:
+                if response.status != 200:
+                    raise OSError(f'识别引擎返回 HTTP {response.status}')
+                text = consume_ocr_stream(response)
+            if expired.is_set():
+                raise TimeoutError('本页识别超时，已跳过并保留原图。')
+            return text
+        except (OSError, ValueError, http.client.HTTPException) as failure:
+            if expired.is_set() or isinstance(failure, TimeoutError):
+                raise TimeoutError('本页识别超时，已跳过并保留原图。') from failure
+            if isinstance(failure, http.client.HTTPException):
+                raise OSError(f'识别连接中断：{failure}') from failure
+            raise
+        finally:
+            if timer:
+                timer.cancel()
+            connection.close()
 
     def close(self):
+        self.stopped.set()
+        if self.monitor:
+            self.monitor.join(timeout=8)
         if self.process and self.process.poll() is None:
             self.process.terminate()
             try:
@@ -493,9 +591,13 @@ def convert(pdf, output, title, author, language, resources, retry_failed=False)
                     results[index] = result
             except (OSError, ValueError, KeyError, TypeError):
                 continue
+        concurrency = preferred_parallelism() if len(segments) > 1 else 1
+        execution = {'initial_parallelism': concurrency, 'final_parallelism': concurrency,
+                     'max_active_tasks': 0, 'peak_engine_rss_bytes': 0, 'peak_cpu_machine_percent': 0, 'resource_events': []}
         state = {'source': str(pdf), 'source_sha256': digest.hexdigest(), 'cache': str(cache),
                  'total_pages': count, 'segments': [[a+1,b] for a,b in segments],
                  'completed': len(results), 'cache_hits': len(results), 'status': 'running', 'version': CACHE_VERSION,
+                 'execution': execution, 'concurrency': concurrency, 'active_pages': [], 'resource_message': None,
                  'stage': 'planning', 'current_page': None, 'current_part': None, 'page_started_at': time.time()}
         started = time.monotonic()
         def status(value, **changes):
@@ -507,7 +609,7 @@ def convert(pdf, output, title, author, language, resources, retry_failed=False)
                 completed = sum(i in results for i in range(first, last))
                 reviews = sum(bool(results[i].get('error')) for i in range(first, last) if i in results)
                 part_status = ('review' if reviews else 'complete') if completed == last-first else 'waiting'
-                if state['current_part'] == number and completed < last-first:
+                if (state['current_part'] == number or any(p['part'] == number for p in state['active_pages'])) and completed < last-first:
                     part_status = 'paused' if value == 'paused' else 'processing'
                 progress.append({'number': number, 'first': first+1, 'last': last, 'completed': completed,
                                  'review_count': reviews, 'status': part_status})
@@ -525,15 +627,56 @@ def convert(pdf, output, title, author, language, resources, retry_failed=False)
         if preprocessing_warning:
             print(preprocessing_warning, flush=True)
         print(f'正在分段：共 {count} 页，{len(segments)} 段；已缓存 {len(results)} 页。', flush=True)
-        missing = iter(i for i in range(count) if i not in results)
+        groups = [list(enumerate(segments, 1))[i:i+concurrency] for i in range(0, len(segments), concurrency)]
+        waves = []
+        for group in groups:
+            waves.append([[(part, index) for part, index in zip([p for p, _ in group], indices) if index is not None and index not in results]
+                          for indices in zip_longest(*(range(first,last) for _,(first,last) in group))])
+        missing = iter(index for group in waves for wave in group for _,index in wave)
         pool = None
         pending = {}
-        ocr = LocalOCR(resources, folder)
+        ocr = LocalOCR(resources, folder, concurrency)
+        executor = ThreadPoolExecutor(max_workers=2)
         live = folder / '转换中.md'
         live.write_text('', encoding='utf-8')
-        def append_live(index, result):
+        next_live = 0
+        def flush_live():
+            nonlocal next_live
             with live.open('a', encoding='utf-8') as document:
-                document.write(('\n\n---\n\n' if index else '') + page_markdown(index, result))
+                while next_live in results:
+                    document.write(('\n\n---\n\n' if next_live else '') + page_markdown(next_live, results[next_live]))
+                    next_live += 1
+        def save_result(index, prepared, text, error, error_type, page_started):
+            raw_text = text.replace('\r\n','\n')
+            text = raw_text + prepared['pictures']
+            result = {'markdown': text, 'raw_text': raw_text,
+                      'files': re.findall(r'!\[[^\]]*\]\(images/([^/)]+)\)', text),
+                      'error': error, 'error_type': error_type, 'seconds': round(time.monotonic()-page_started,2),
+                      'preprocessing': prepared.get('preprocessing')}
+            atomic_json(cache / 'page-results' / f'{index+1:05d}.json', result)
+            results[index] = result
+            state['active_pages'] = [p for p in state['active_pages'] if p['pdf_page'] != index+1]
+            flush_live()
+            status('running')
+            print(f'已处理 {len(results)}/{count} 页（PDF 第 {index+1} 页），本页 {result["seconds"]:.1f} 秒', flush=True)
+        def update_resources():
+            if ocr.metrics:
+                execution['peak_engine_rss_bytes'] = max(execution['peak_engine_rss_bytes'], ocr.metrics['rss_bytes'])
+                execution['peak_cpu_machine_percent'] = max(execution['peak_cpu_machine_percent'], ocr.metrics['cpu_machine_percent'])
+            if concurrency == 2 and ocr.limit_reason:
+                state['resource_message'] = ocr.limit_reason + '，自动改为单任务'
+        def adjust_concurrency():
+            nonlocal concurrency, ocr
+            update_resources()
+            if concurrency == 2 and ocr.limit_reason:
+                concurrency = 1
+                execution['final_parallelism'] = 1
+                execution['resource_events'].append(state['resource_message'])
+                state['concurrency'] = 1
+                print(state['resource_message'], flush=True)
+                ocr.close()
+                ocr = LocalOCR(resources, folder, 1)
+        flush_live()
         def new_pool():
             return multiprocessing.get_context('spawn').Pool(processes=1, initializer=initialize_preparation,
                 initargs=(str(pdf), str(cache), decorations))
@@ -555,76 +698,94 @@ def convert(pdf, output, title, author, language, resources, retry_failed=False)
                 pool = new_pool()
                 submit_next()
                 submit_next()
-            for part, (first, last) in enumerate(segments, 1):
-                for index in range(first, last):
-                    if index in results:
-                        append_live(index, results[index])
-                        continue
-                    page_started = time.monotonic()
-                    status('running', stage='preparing', current_part=part, current_page=index+1, page_started_at=time.time())
-                    print(f'正在处理第 {part}/{len(segments)} 段，第 {index+1}/{count} 页', flush=True)
-                    error = None
-                    error_type = None
-                    try:
-                        prepared = pending.pop(index).get(timeout=PREPARATION_TIMEOUT)
-                        submit_next()
-                    except Exception as failure:
-                        if isinstance(failure, OSError) and failure.errno in (13, 28):
-                            raise
-                        error = '页面渲染超时' if isinstance(failure, multiprocessing.TimeoutError) else f'页面渲染异常：{failure}'
-                        error_type = 'render_error'
-                        restart_preparation()
-                        image = cache/'images'/f'page-{index+1:05d}.png'
-                        pictures = ''
-                        if image.is_file():
-                            from PIL import Image
+            for group, group_waves in zip(groups, waves):
+                saved_parts = set()
+                for wave in group_waves:
+                    queue = list(wave)
+                    while queue:
+                        adjust_concurrency()
+                        batch, queue = queue[:concurrency], queue[concurrency:]
+                        futures = {}
+                        restart_ocr = False
+                        state['active_pages'] = [{'pdf_page': index+1, 'part': part, 'started_at': time.time(), 'stage': 'preparing'} for part,index in batch]
+                        execution['max_active_tasks'] = max(execution['max_active_tasks'], len(batch))
+                        for part, index in batch:
+                            page_started = time.monotonic()
+                            status('running', stage='preparing', current_part=part, current_page=index+1, page_started_at=time.time())
+                            print(f'正在处理第 {part}/{len(segments)} 段，第 {index+1}/{count} 页', flush=True)
+                            error = None
+                            error_type = None
                             try:
-                                with Image.open(image) as source:
-                                    source.verify()
-                                pictures = f'\n\n![第 {index+1} 页原图](images/{image.name})'
-                            except (OSError, ValueError):
-                                pass
-                        prepared = {'text': '', 'blank': False, 'scanned': False, 'pictures': pictures}
-                        print(f'第 {index+1} 页待校对，自动跳过：{error}', flush=True)
-                    if error:
-                        text = ''
-                    elif prepared['blank']:
-                        text = '[空白页]'
-                    elif prepared['scanned']:
-                        status('running', stage='recognizing')
-                        try:
-                            with operation_deadline():
-                                text = ocr.read(Path(prepared['image']))
-                        except (ValueError, OSError) as failure:
-                            error = str(failure)
-                            error_type = 'ocr_timeout' if isinstance(failure, TimeoutError) else 'ocr_error'
-                            text = ''
+                                prepared = pending.pop(index).get(timeout=PREPARATION_TIMEOUT)
+                                submit_next()
+                            except Exception as failure:
+                                if isinstance(failure, OSError) and failure.errno in (13, 28):
+                                    raise
+                                error = '页面渲染超时' if isinstance(failure, multiprocessing.TimeoutError) else f'页面渲染异常：{failure}'
+                                error_type = 'render_error'
+                                restart_preparation()
+                                image = cache/'images'/f'page-{index+1:05d}.png'
+                                pictures = ''
+                                if image.is_file():
+                                    from PIL import Image
+                                    try:
+                                        with Image.open(image) as source:
+                                            source.verify()
+                                        pictures = f'\n\n![第 {index+1} 页原图](images/{image.name})'
+                                    except (OSError, ValueError):
+                                        pass
+                                prepared = {'text': '', 'blank': False, 'scanned': False, 'pictures': pictures}
+                                print(f'第 {index+1} 页待校对，自动跳过：{error}', flush=True)
+                            if error or prepared['blank'] or not prepared['scanned']:
+                                text = '' if error else '[空白页]' if prepared['blank'] else prepared['text']
+                                save_result(index, prepared, text, error, error_type, page_started)
+                            else:
+                                for page in state['active_pages']:
+                                    if page['pdf_page'] == index+1:
+                                        page.update(stage='recognizing', started_at=time.time())
+                                status('running', stage='recognizing')
+                                futures[executor.submit(ocr.read, Path(prepared['image']))] = (index, prepared, page_started)
+                        while futures:
+                            done, _ = wait(futures, timeout=.25, return_when=FIRST_COMPLETED)
+                            update_resources()
+                            for future in done:
+                                index, prepared, page_started = futures.pop(future)
+                                error = error_type = None
+                                try:
+                                    text = future.result()
+                                except (ValueError, OSError) as failure:
+                                    error = str(failure)
+                                    error_type = 'ocr_timeout' if isinstance(failure, TimeoutError) else 'ocr_error'
+                                    text = ''
+                                    restart_ocr = True
+                                    print(f'PDF 第 {index+1} 页待校对，已保留原图并继续：{error}', flush=True)
+                                save_result(index, prepared, text, error, error_type, page_started)
+                            status('running')
+                        adjust_concurrency()
+                        if restart_ocr:
+                            update_resources()
+                            # Drain both requests before replacing the one shared engine.
+                            reason = ocr.limit_reason
                             ocr.close()
-                            print(f'第 {index+1} 页待校对，已保留原图并继续：{error}', flush=True)
-                    else:
-                        text = prepared['text']
-                    raw_text = text.replace('\r\n','\n')
-                    text = raw_text + prepared['pictures']
-                    files = re.findall(r'!\[[^\]]*\]\(images/([^/)]+)\)', text)
-                    result = {'markdown': text, 'raw_text': raw_text, 'files': files, 'error': error,
-                              'error_type': error_type, 'seconds': round(time.monotonic()-page_started,2),
-                              'preprocessing': prepared.get('preprocessing')}
-                    atomic_json(cache / 'page-results' / f'{index+1:05d}.json', result)
-                    results[index] = result
-                    append_live(index, result)
-                    status('running')
-                    print(f'已完成 {index+1}/{count} 页，本页 {result["seconds"]:.1f} 秒', flush=True)
-                (folder / f'part-{part:02d}.md').write_text('\n\n---\n\n'.join(page_markdown(i, results[i]) for i in range(first,last)), encoding='utf-8')
+                            ocr = LocalOCR(resources, folder, concurrency)
+                            ocr.limit_reason = reason
+                    for part, (first,last) in group:
+                        if part not in saved_parts and all(i in results for i in range(first,last)):
+                            (folder / f'part-{part:02d}.md').write_text('\n\n---\n\n'.join(page_markdown(i, results[i]) for i in range(first,last)), encoding='utf-8')
+                            saved_parts.add(part)
+                            print(f'第 {part}/{len(segments)} 段已保存，自动继续。', flush=True)
+                adjust_concurrency()
                 ocr.close()
-                if part < len(segments) and pool is not None and len(results) < count:
+                ocr = LocalOCR(resources, folder, concurrency)
+                if group != groups[-1] and pool is not None and len(results) < count:
                     restart_preparation()
-                print(f'第 {part}/{len(segments)} 段已保存，自动继续。', flush=True)
             status('assembling', stage='packaging')
         except BaseException:
             status('paused')
             raise
         finally:
             ocr.close()
+            executor.shutdown(wait=True, cancel_futures=True)
             if pool:
                 pool.terminate(); pool.join()
         shutil.copyfile(live, folder / 'content.md')
@@ -646,11 +807,12 @@ def convert(pdf, output, title, author, language, resources, retry_failed=False)
                              'removed_margin_items': sum((r.get('preprocessing') or {}).get('removed_margin_items', 0) for r in results.values()),
                              'warning': preprocessing_warning}
             report = {'total_pages': count, 'normal_pages': count-len(reviews), 'review_pages': reviews,
-                      'segments': state['segments'], 'validation': validation, 'preprocessing': preprocessing}
+                      'segments': state['segments'], 'validation': validation, 'preprocessing': preprocessing, 'execution': execution}
             atomic_json(folder/'转换报告.json', report)
             (folder/'转换报告.md').write_text(f'# 转换报告\n\nPDF 共 {count} 页，分 {len(segments)} 段，正常处理 {count-len(reviews)} 页，需校对 {len(reviews)} 页。\n\n'
                 '页码均指原 PDF 物理页，从封面第 1 页起。异常页已自动跳过，不会阻止后续页面处理。\n\n'
                 + f'已清理 {preprocessing["cleaned_pages"]} 页的 {preprocessing["removed_margin_items"]} 处重复页边装饰；扫描页使用最高 300 DPI 高清输入，参考图已清边并裁去空白。原 PDF 未修改。\n\n'
+                + f'分段并行：初始 {execution["initial_parallelism"]} 个任务，结束时 {execution["final_parallelism"]} 个任务。' + ('；'.join(execution['resource_events']) or '未触发资源降级。') + '\n\n'
                 + ((preprocessing_warning+'\n\n') if preprocessing_warning else '')
                 + ('\n'.join('- '+warning for warning in warnings) if warnings else '未检测到处理异常。')
                 + f'\n\n自动校验通过：{count} 条页面记录、{validation["images"]} 张图片及 EPUB 结构完整。\n', encoding='utf-8')

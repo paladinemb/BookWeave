@@ -1,0 +1,151 @@
+name: Build and publish desktop installers
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - mac-app/Info.plist
+      - .github/workflows/release.yml
+permissions:
+  contents: read
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  draft:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: |
+          python3 - <<'PY'
+          import os,plistlib,re
+          from pathlib import Path
+          version=plistlib.loads(Path('mac-app/Info.plist').read_bytes())['CFBundleShortVersionString']
+          assert re.fullmatch(r'\d+\.\d+\.\d+',version)
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:f.write(f'version={version}\ntag=v{version}\n')
+          PY
+      - name: Prepare draft; never overwrite a published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --json isDraft > /tmp/release.json 2>/dev/null; then
+            python3 -c 'import json; assert json.load(open("/tmp/release.json"))["isDraft"], "Bump Info.plist before publishing another release"'
+            gh release edit "$TAG" --target "$GITHUB_SHA" --notes-file release/notes.md
+          else
+            gh release create "$TAG" --draft --target "$GITHUB_SHA" --title "BookWeave ${TAG#v}" --notes-file release/notes.md
+          fi
+  build:
+    needs: draft
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macos-arm64
+            os: macos-15
+          - target: macos-x64
+            os: macos-15-intel
+          - target: windows-x64
+            os: windows-2022
+          - target: linux-x64
+            os: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Linux desktop build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk xvfb libxft2 libxrender1 libgomp1
+      - name: Windows installer compiler
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (!(Test-Path 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe')) { choco install innosetup --no-progress -y }
+      - name: Install build dependencies
+        run: python -m pip install -r requirements.txt pyinstaller==6.22.3
+      - name: Test shared converter and packager
+        run: |
+          python -B -m unittest discover -s mac-app/tests
+          (cd pdf2epub && python -B -m unittest discover -s tests)
+      - uses: actions/cache@v4
+        with:
+          path: runtime-resources/paddle-engine/models
+          key: ocr-models-${{ hashFiles('release/resources.json') }}
+      - name: Download and verify official resources
+        run: python scripts/prepare_release.py '${{ matrix.target }}'
+      - name: Build and test native Mac app
+        if: runner.os == 'macOS'
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.draft.outputs.version }}
+        run: |
+          bash scripts/build_app.sh runtime-resources dist/BookWeave.app
+          dist/BookWeave.app/Contents/Resources/python-runtime/bin/python3.12 -B release/verify_mac.py dist/BookWeave.app
+          codesign --verify --deep --strict dist/BookWeave.app
+          mkdir -p release-output build/dmg
+          mv dist/BookWeave.app build/dmg/
+          ln -s /Applications build/dmg/Applications
+          hdiutil create -volname BookWeave -srcfolder build/dmg -ov -format UDZO "release-output/BookWeave-$VERSION-$TARGET.dmg"
+      - name: Build and test Windows/Linux installer
+        if: runner.os != 'macOS'
+        run: python scripts/build_desktop.py
+      - name: Verify size and create installer checksum
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import hashlib
+          files=[p for p in Path('release-output').iterdir() if not p.name.endswith('.sha256')]
+          assert len(files)==1,files
+          for path in files:
+            assert 0<path.stat().st_size<2*1024**3
+            with path.open('rb') as f:digest=hashlib.file_digest(f,'sha256').hexdigest()
+            path.with_suffix(path.suffix+'.sha256').write_text(f'{digest}  {path.name}\n')
+          PY
+      - name: Upload to private draft area
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.draft.outputs.tag }}
+        run: gh release upload "$TAG" release-output/* --clobber
+      - name: Show smoke test diagnostics on failure
+        if: failure()
+        run: python -c "from pathlib import Path; [print(str(p)+'\n'+p.read_text(errors='replace')[-20000:]) for p in Path('build').glob('*.log')]"
+  publish:
+    needs: [draft, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify all installers, combine checksums and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.draft.outputs.tag }}
+          VERSION: ${{ needs.draft.outputs.version }}
+        run: |
+          gh release view "$TAG" --json assets > /tmp/assets.json
+          python3 - <<'PY'
+          import json,os
+          v=os.environ['VERSION']
+          expected={f'BookWeave-{v}-'+suffix for suffix in ['macos-arm64.dmg','macos-x64.dmg','windows-x64-setup.exe','linux-x64.deb']}
+          assets={a['name'] for a in json.load(open('/tmp/assets.json'))['assets']}
+          assert expected | {name+'.sha256' for name in expected} <= assets,assets
+          PY
+          mkdir checksums
+          gh release download "$TAG" --pattern '*.sha256' --dir checksums
+          cat checksums/*.sha256 > SHA256SUMS
+          gh release upload "$TAG" SHA256SUMS --clobber
+          gh release edit "$TAG" --draft=false --latest

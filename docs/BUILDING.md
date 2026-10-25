@@ -1,6 +1,6 @@
 # 构建 BookWeave.app
 
-需要 Apple Silicon Mac、macOS 14+ 和 Xcode Command Line Tools（`xcode-select --install`）。构建过程不安装系统服务，也不修改已有 App。
+需要 Apple Silicon 或 Intel Mac、macOS 14+ 和 Xcode Command Line Tools（`xcode-select --install`）。构建过程不安装系统服务，也不修改已有 App。
 
 ## 1. 准备运行资源
 
@@ -46,3 +46,7 @@ open dist/BookWeave.app
 
 构建使用本机临时签名；尚未提供 Apple Developer ID 签名和公证。对外分发应用包时，应另外完成正式签名、公证和第三方许可证核对。构建后的 App 已包含模型和运行时，正常转换不需要访问外部服务。
 
+
+## Windows／Linux
+
+在对应平台使用 Python 3.12，安装 `requirements.txt` 及 `pyinstaller==6.22.3`。运行 `python scripts/prepare_release.py windows-x64` 或 `linux-x64` 准备已校验的官方资源，再运行 `python scripts/build_desktop.py`。Windows 需要 Inno Setup 6，Linux 需要 `xvfb-run`、Tk 和 `dpkg-deb`。构建中会执行窗口启动、文字版 PDF 和真实扫描页识别测试。详见 [发布说明](RELEASING.md)。

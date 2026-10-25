@@ -8,6 +8,9 @@ BookWeave's application and converter source are distributed under the MIT licen
 | PaddleOCR-VL-1.6 GGUF weights | [Official PaddlePaddle repository](https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6-GGUF), Apache-2.0 |
 | llama.cpp | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp), MIT; tested runtime `b11814` |
 | Python | [python.org](https://www.python.org/), PSF license and bundled notices |
+| Windows/Linux packaging | [PyInstaller](https://pyinstaller.org/), GPL-2.0 with the bootloader exception permitting distribution of bundled applications |
+| Windows installer | [Inno Setup](https://jrsoftware.org/isinfo.php), see vendor license |
+| Tk desktop interface | [Tcl/Tk](https://www.tcl.tk/), bundled license terms retained by the packager |
 | Python dependencies | `requirements.txt`; preserve each distribution's license and notices in binary bundles |
 
 Changes to the EPUB packager include image lookup, byte-preserving PNG copies, XHTML metadata compatibility, currency/math handling, and validation with a text fallback for malformed raw HTML.

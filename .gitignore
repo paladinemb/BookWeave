@@ -14,3 +14,5 @@ runtime-resources/
 !fixtures/English-source.pdf
 !fixtures/English-scan.pdf
 
+release-output/
+*.spec

@@ -3,7 +3,7 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 resources="${1:?Usage: bash scripts/build_app.sh RESOURCES [OUTPUT.app]}"
 output="${2:-$root/dist/BookWeave.app}"
-[[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] || { echo 'Requires an Apple Silicon Mac.' >&2; exit 1; }
+[[ "$(uname -s)" == Darwin ]] || { echo 'Requires macOS.' >&2; exit 1; }
 [[ "$output" == *.app && ! -e "$output" ]] || { echo 'Choose a new .app output path.' >&2; exit 1; }
 for file in python-runtime/bin/python3.12 paddle-engine/runtime/llama-b11814/llama-server paddle-engine/models/PaddleOCR-VL-1.6-GGUF.gguf paddle-engine/models/PaddleOCR-VL-1.6-GGUF-mmproj.gguf; do
     [[ -f "$resources/$file" ]] || { echo "Missing resource: $file" >&2; exit 1; }
@@ -20,7 +20,7 @@ cp "$root/THIRD_PARTY_NOTICES.md" "$root/LICENSE" "$output/Contents/Resources/"
 "$output/Contents/Resources/python-runtime/bin/python3.12" -B -I "$root/scripts/prune_resources.py" "$output/Contents/Resources"
 cache="$(mktemp -d)"
 trap 'rm -rf "$cache"' EXIT
-xcrun swiftc -parse-as-library -O -target arm64-apple-macos14.0 -module-cache-path "$cache" "$root/mac-app/PDFtoEPUB.swift" -o "$output/Contents/MacOS/BookWeave"
+xcrun swiftc -parse-as-library -O -target "$(uname -m)-apple-macos14.0" -module-cache-path "$cache" "$root/mac-app/PDFtoEPUB.swift" -o "$output/Contents/MacOS/BookWeave"
 codesign --force --deep --sign - "$output"
 codesign --verify --deep --strict "$output"
 "$output/Contents/MacOS/BookWeave" --self-test

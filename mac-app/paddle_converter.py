@@ -4,7 +4,8 @@ import math
 import re
 import shutil
 import argparse
-from contextlib import closing
+from contextlib import closing, contextmanager
+import platform
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from itertools import zip_longest
 import http.client
@@ -24,6 +25,38 @@ import urllib.request
 
 PAGE_TIMEOUT = 90
 PREPARATION_TIMEOUT = 60
+
+
+def default_cache_directory():
+    if sys.platform == 'win32':
+        return Path(os.environ.get('LOCALAPPDATA', Path.home()/'AppData/Local'))/'BookWeave/cache'
+    if sys.platform == 'darwin':
+        return Path.home()/'Library/Application Support/BookWeave/cache'
+    return Path(os.environ.get('XDG_CACHE_HOME', Path.home()/'.cache'))/'bookweave'
+
+
+@contextmanager
+def job_lock(path):
+    with path.open('a+b') as lock:
+        if sys.platform == 'win32':
+            import msvcrt
+            if lock.tell() == 0:
+                lock.write(b'0'); lock.flush()
+            lock.seek(0)
+            acquire = lambda: msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            release = lambda: (lock.seek(0), msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1))
+        else:
+            import fcntl
+            acquire = lambda: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            release = lambda: fcntl.flock(lock, fcntl.LOCK_UN)
+        try:
+            acquire()
+        except OSError as failure:
+            raise RuntimeError('同一份 PDF 已在转换中，请等待当前任务完成。') from failure
+        try:
+            yield
+        finally:
+            release()
 
 
 def resource_sample(pid=None):
@@ -150,25 +183,34 @@ class LocalOCR:
                         self.process.terminate()
                 return
 
+    def command(self, port):
+        engine = self.resources / 'paddle-engine'
+        models = engine / 'models'
+        gpu = '99' if sys.platform == 'darwin' and platform.machine() == 'arm64' else '0'
+        return [str(engine / ('runtime/llama-b11814/llama-server' + ('.exe' if sys.platform == 'win32' else ''))),
+                '-m', str(models / 'PaddleOCR-VL-1.6-GGUF.gguf'),
+                '--mmproj', str(models / 'PaddleOCR-VL-1.6-GGUF-mmproj.gguf'),
+                '--host', '127.0.0.1', '--port', str(port), '-ngl', gpu,
+                '-c', str(16384*self.parallelism), '--parallel', str(self.parallelism), '--temp', '0']
+
     def start(self):
         with socket.socket() as sock:
             sock.bind(('127.0.0.1', 0))
             port = sock.getsockname()[1]
         self.url = f'http://127.0.0.1:{port}'
-        engine = self.resources / 'paddle-engine'
-        models = engine / 'models'
         self.log = (self.folder / '识别引擎记录.txt').open('a')
         baseline = resource_sample()
         self.initial_swap = baseline['swap_bytes'] if baseline else None
         if self.stopped.is_set():
             raise OSError('识别引擎已停止。')
-        self.process = subprocess.Popen([
-            str(engine / 'runtime/llama-b11814/llama-server'),
-            '-m', str(models / 'PaddleOCR-VL-1.6-GGUF.gguf'),
-            '--mmproj', str(models / 'PaddleOCR-VL-1.6-GGUF-mmproj.gguf'),
-            '--host', '127.0.0.1', '--port', str(port),
-            '-ngl', '99', '-c', str(16384*self.parallelism), '--parallel', str(self.parallelism), '--temp', '0',
-        ], stdout=self.log, stderr=subprocess.STDOUT)
+        environment = os.environ.copy()
+        if sys.platform.startswith('linux'):
+            if 'LD_LIBRARY_PATH_ORIG' in environment:
+                environment['LD_LIBRARY_PATH'] = environment['LD_LIBRARY_PATH_ORIG']
+            else:
+                environment.pop('LD_LIBRARY_PATH', None)
+        self.process = subprocess.Popen(self.command(port), stdout=self.log, stderr=subprocess.STDOUT,
+            env=environment, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         self.monitor = threading.Thread(target=self.watch_resources, daemon=True)
         self.monitor.start()
         for _ in range(90):
@@ -193,7 +235,7 @@ class LocalOCR:
             if self.stopped.is_set():
                 raise OSError('识别引擎已停止。')
             if self.process is None:
-                print('正在加载 PaddleOCR-VL-1.6（Apple GPU）…', flush=True)
+                print('正在加载 PaddleOCR-VL-1.6…', flush=True)
                 self.start()
         if isinstance(image, Path):
             data = image.read_bytes()
@@ -545,7 +587,6 @@ def prepare_page(index):
 
 def convert(pdf, output, title, author, language, resources, retry_failed=False):
     import pypdfium2 as pdfium
-    import fcntl
     import multiprocessing
     pdf, output, resources = Path(pdf), Path(output), Path(resources)
     if not pdf.is_file() or pdf.suffix.lower() != '.pdf':
@@ -557,15 +598,11 @@ def convert(pdf, output, title, author, language, resources, retry_failed=False)
         for block in iter(lambda: source.read(1024*1024), b''):
             digest.update(block)
     key = hashlib.sha256((digest.hexdigest()+CACHE_VERSION).encode()).hexdigest()
-    cache_root = Path(os.environ.get('BOOKWEAVE_CACHE_DIR', str(Path.home()/'Library/Application Support/BookWeave/cache')))
+    cache_root = Path(os.environ.get('BOOKWEAVE_CACHE_DIR', str(default_cache_directory())))
     cache = cache_root / key
     (cache / 'images').mkdir(parents=True, exist_ok=True)
     (cache / 'page-results').mkdir(exist_ok=True)
-    with (cache / 'job.lock').open('a') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise RuntimeError('同一份 PDF 已在转换中，请等待当前任务完成。')
+    with job_lock(cache / 'job.lock'):
         with closing(pdfium.PdfDocument(str(pdf))) as doc:
             count = len(doc)
             segments = page_segments(count)
@@ -869,7 +906,7 @@ def main():
             args.title, args.author, _, args.language = answers[:4]
     if args.language not in ('zh', 'en'):
         parser.error('Unsupported language')
-    if os.getpgrp() != os.getpid():
+    if sys.platform != 'win32' and os.getpgrp() != os.getpid():
         os.setsid()
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(130))
     convert(args.pdf, args.output, args.title or args.pdf.stem, args.author, args.language, Path(__file__).resolve().parent, args.retry_failed)

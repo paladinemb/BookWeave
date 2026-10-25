@@ -1,0 +1,48 @@
+{
+  "python": [
+    {
+      "name": "cpython-3.12.15+20261021-aarch64-apple-darwin-install_only_stripped.tar.gz",
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261021/cpython-3.12.15%2B20261021-aarch64-apple-darwin-install_only_stripped.tar.gz",
+      "sha256": "7b8d00b751db21cea87dc551a8f8165147c5fbc5251d5537d7e5497dde00a219"
+    },
+    {
+      "name": "cpython-3.12.15+20261021-x86_64-apple-darwin-install_only_stripped.tar.gz",
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261021/cpython-3.12.15%2B20261021-x86_64-apple-darwin-install_only_stripped.tar.gz",
+      "sha256": "f12e0504397683d6be0745ffd4c39ef45a455cec169adf35c628840d06133773"
+    }
+  ],
+  "llama": [
+    {
+      "name": "llama-b11814-bin-macos-arm64.tar.gz",
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11814/llama-b11814-bin-macos-arm64.tar.gz",
+      "sha256": "698d16c10104ad5212fdd9cb084e7076b3ab4255c68433ee8ed70f3d041432cb"
+    },
+    {
+      "name": "llama-b11814-bin-macos-x64.tar.gz",
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11814/llama-b11814-bin-macos-x64.tar.gz",
+      "sha256": "cb38196573bcf57c441523f15da3129ef162f202fdacf7c14d7b41c2156cc858"
+    },
+    {
+      "name": "llama-b11814-bin-ubuntu-x64.tar.gz",
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11814/llama-b11814-bin-ubuntu-x64.tar.gz",
+      "sha256": "9a9d555b68e6294ed8ca27381c204e25b6b24066c770af154463f25ca661e894"
+    },
+    {
+      "name": "llama-b11814-bin-win-cpu-x64.zip",
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11814/llama-b11814-bin-win-cpu-x64.zip",
+      "sha256": "b8c565df75a7aa10df72cee8839a184f4b65470b65dc49209ba00ebeccdd8edf"
+    }
+  ],
+  "models": [
+    {
+      "name": "PaddleOCR-VL-1.6-GGUF.gguf",
+      "url": "https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6-GGUF/resolve/main/PaddleOCR-VL-1.6-GGUF.gguf",
+      "sha256": "f3ae46ec885050acf4b3d31944431e1fd90d50664fb09126af4a3c050ba14ee8"
+    },
+    {
+      "name": "PaddleOCR-VL-1.6-GGUF-mmproj.gguf",
+      "url": "https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6-GGUF/resolve/main/PaddleOCR-VL-1.6-GGUF-mmproj.gguf",
+      "sha256": "204d757d7610d9b3faab10d506d69e5b244e32bf765e2bab2d0167e65e0a058a"
+    }
+  ]
+}

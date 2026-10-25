@@ -2,13 +2,13 @@
 
 # BookWeave
 
-本地运行的 macOS PDF → EPUB 应用。支持中文、英文、文字版 PDF 和扫描版 PDF，保留页面图片，生成可编辑的文字和 Markdown。
+本地运行的 macOS／Windows／Linux PDF → EPUB 应用。支持中文、英文、文字版 PDF 和扫描版 PDF，保留页面图片，生成可编辑的文字和 Markdown。
 
-A native macOS app that turns Chinese and English PDFs into editable EPUBs using local PaddleOCR-VL-1.6 inference. Text PDFs skip OCR; scanned pages retain their reference images.
+A desktop app that turns Chinese and English PDFs into editable EPUBs using local PaddleOCR-VL-1.6 inference. Text PDFs skip OCR; scanned pages retain their reference images.
 
 ## 功能
 
-- 原生 SwiftUI 界面，文件在本机处理。
+- macOS 使用原生 SwiftUI 界面，Windows／Linux 使用桌面界面，共用转换核心；文件在本机处理。
 - 构建时精简无用运行资源，保留主识别模型、必需视觉模型及服务端依赖。
 - PaddleOCR-VL-1.6 GGUF，通过 llama.cpp 使用 Apple GPU。
 - 每段最多 300 页并平均分配：1000 页分 4 段，800 页分 3 段；最终汇总为一个 EPUB。
@@ -23,7 +23,9 @@ A native macOS app that turns Chinese and English PDFs into editable EPUBs using
 
 ## 使用与构建
 
-运行环境为 **Apple Silicon Mac，macOS 14 或更新版本**。本仓库提供源码，模型权重和 Python/llama.cpp 运行时单独准备，详见 [构建说明](docs/BUILDING.md)。
+安装包见 [GitHub Releases](https://github.com/paladinemb/BookWeave/releases)。发布流程构建 macOS Apple Silicon／Intel 的 `.dmg`、Windows x64 的安装 `.exe`、Ubuntu 24.04+／兼容 Debian x64 的 `.deb`，包含 Python、识别引擎和两个模型。四个平台通过验证后才发布；若流程仍在运行或失败，发布页可能暂时没有新安装包。
+
+Apple Silicon 使用 Metal GPU，Intel Mac／Windows／Linux 使用 CPU，后者识别扫描书会更慢。源码构建及发布操作见 [构建说明](docs/BUILDING.md) 和 [发布说明](docs/RELEASING.md)。
 
 选择 PDF，填写书名和电子书语言，点击“开始／继续转换”。同一份 PDF 的已完成页面会自动复用，各段自动处理；异常页自动标记并跳过。每次输出保存到独立目录，避免覆盖已编辑的文件。
 

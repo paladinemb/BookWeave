@@ -18,7 +18,7 @@ def build():
     windows=sys.platform=='win32'
     data=[(ROOT/'runtime-resources/paddle-engine','paddle-engine'),(ROOT/'pdf2epub/modules','pdf2epub/modules'),
           (ROOT/'pdf2epub/LICENSE','pdf2epub'),(ROOT/'THIRD_PARTY_NOTICES.md','.'),(ROOT/'LICENSE','.')]
-    args=[sys.executable,'-m','PyInstaller','--noconfirm','--clean','--onedir','--windowed','--name','BookWeave',
+    args=[sys.executable,'-m','PyInstaller','--noconfirm','--clean','--onedir','--windowed','--python-option','X utf8','--name','BookWeave',
           '--paths',ROOT/'mac-app','--paths',ROOT/'pdf2epub','--collect-all','pypdfium2_raw','--collect-submodules','markdown.extensions','--collect-data','latex2mathml']
     for package in ['pypdfium2','Pillow','Markdown','regex','latex2mathml']:args += ['--copy-metadata',package]
     for source,dest in data:args += ['--add-data',f'{source}:{dest}']

@@ -6,11 +6,13 @@ on:
     paths:
       - mac-app/Info.plist
       - .github/workflows/release.yml
+env:
+  PYTHONUTF8: '1'
 permissions:
   contents: read
 concurrency:
   group: desktop-release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 jobs:
   draft:
     runs-on: ubuntu-24.04

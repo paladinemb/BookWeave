@@ -530,7 +530,7 @@ def validate_epub(epub, results, total_pages):
                 copied_without_changes = source.suffix.lower() == '.png' and max(picture.size) <= 1800
             if copied_without_changes and archive.getinfo(target).CRC != zlib.crc32(source.read_bytes()):
                 raise RuntimeError(f'校验失败：图片 {name} 与原图不一致。')
-        if (epub.parent/'content.md').read_text() != '\n\n---\n\n'.join(page_markdown(i, results[i]) for i in range(total_pages)):
+        if (epub.parent/'content.md').read_text(encoding='utf-8') != '\n\n---\n\n'.join(page_markdown(i, results[i]) for i in range(total_pages)):
             raise RuntimeError('校验失败：PDF 页序与汇总正文不一致。')
         chapter = ElementTree.fromstring(archive.read('OPS/s00000-content.xhtml'))
         actual_images = [Path(node.attrib['src']).name for node in chapter.iter() if node.tag.endswith('img')]
@@ -545,7 +545,7 @@ def initialize_preparation(pdf, cache, decorations):
     preparation_doc = pdfium.PdfDocument(pdf)
     preparation_cache = Path(cache)
     preparation_decorations = decorations
-    preparation_raster_decorations = json.loads((preparation_cache/'raster-decorations.json').read_text())['patterns']
+    preparation_raster_decorations = json.loads((preparation_cache/'raster-decorations.json').read_text(encoding='utf-8'))['patterns']
 
 
 def prepare_page(index):
@@ -608,7 +608,7 @@ def convert(pdf, output, title, author, language, resources, retry_failed=False)
             segments = page_segments(count)
             decoration_file = cache / 'decorations.json'
             if decoration_file.exists():
-                decorations = set(json.loads(decoration_file.read_text()))
+                decorations = set(json.loads(decoration_file.read_text(encoding='utf-8')))
             else:
                 print('正在检查重复页边装饰…', flush=True)
                 decorations = repeated_decorations(doc)
@@ -617,7 +617,7 @@ def convert(pdf, output, title, author, language, resources, retry_failed=False)
         for index in range(count):
             path = cache / 'page-results' / f'{index+1:05d}.json'
             try:
-                result = json.loads(path.read_text())
+                result = json.loads(path.read_text(encoding='utf-8'))
                 if not result.get('error') and text_issue(result.get('raw_text', result['markdown'])):
                     result['error'] = text_issue(result.get('raw_text', result['markdown']))
                     result['error_type'] = 'ocr_quality'
@@ -660,7 +660,7 @@ def convert(pdf, output, title, author, language, resources, retry_failed=False)
             print('正在检查扫描图中的重复页边装饰…', flush=True)
             patterns, warning = scan_raster_decorations(pdf)
             atomic_json(raster_file, {'patterns': patterns, 'warning': warning})
-        preprocessing_warning = json.loads(raster_file.read_text())['warning']
+        preprocessing_warning = json.loads(raster_file.read_text(encoding='utf-8'))['warning']
         if preprocessing_warning:
             print(preprocessing_warning, flush=True)
         print(f'正在分段：共 {count} 页，{len(segments)} 段；已缓存 {len(results)} 页。', flush=True)
@@ -892,6 +892,9 @@ def package_book(folder, pdf, title, author, language, resources):
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8')
     parser = argparse.ArgumentParser(description='BookWeave: PDF to EPUB using PaddleOCR-VL-1.6')
     parser.add_argument('pdf', type=Path)
     parser.add_argument('output', type=Path)

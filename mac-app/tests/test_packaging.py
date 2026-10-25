@@ -1,3 +1,4 @@
+import sys
 import importlib.util
 import tempfile
 import unittest
@@ -7,6 +8,7 @@ from unittest.mock import patch
 SCRIPT = Path(__file__).resolve().parents[2]/'scripts/prune_resources.py'
 
 
+@unittest.skipIf(sys.platform == 'win32', 'macOS pruner uses POSIX executable permissions; verified on macOS/Linux')
 class PackagingTest(unittest.TestCase):
     def load_pruner(self):
         self.assertTrue(SCRIPT.is_file(), 'Build still bundles unused runtime resources')

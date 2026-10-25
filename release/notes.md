@@ -7,7 +7,7 @@ BookWeave supports offline Chinese/English PDF → EPUB conversion. Runtime and 
 | windows-x64-setup.exe | Windows 10/11 64-bit, AVX2-capable CPU |
 | linux-x64.deb | Ubuntu 24.04+ / compatible Debian, x64 AVX2-capable CPU |
 
-macOS retains the native SwiftUI interface. Windows/Linux use a desktop interface with the same conversion core, segment progress and automatic review reports. CPU OCR on Windows/Linux and Intel Mac can be considerably slower than Apple Silicon GPU OCR.
+macOS retains the native SwiftUI interface. Windows/Linux use a desktop interface with the same conversion core, segment progress and automatic review reports. CPU OCR on Windows/Linux and Intel Mac can be considerably slower than Apple Silicon GPU OCR. GPU recognition uses a 90-second page limit, CPU recognition 300 seconds. Apple Silicon automatically uses CPU if no usable Metal device is available.
 
 Large PDFs are split into balanced segments; up to two different segments run together when resource monitoring permits. Small PDFs stay serial. Bad pages are marked against the original PDF page number and do not stop the remaining pages.
 

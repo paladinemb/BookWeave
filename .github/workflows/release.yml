@@ -116,7 +116,7 @@ jobs:
           for path in files:
             assert 0<path.stat().st_size<2*1024**3
             with path.open('rb') as f:digest=hashlib.file_digest(f,'sha256').hexdigest()
-            path.with_suffix(path.suffix+'.sha256').write_text(f'{digest}  {path.name}\n')
+            path.with_suffix(path.suffix+'.sha256').write_bytes(f'{digest}  {path.name}\n'.encode('ascii'))
           PY
       - name: Upload to private draft area
         env:
@@ -125,7 +125,7 @@ jobs:
         run: gh release upload "$TAG" release-output/* --clobber
       - name: Show smoke test diagnostics on failure
         if: failure()
-        run: python -c "from pathlib import Path; [print(str(p)+'\n'+p.read_text(errors='replace')[-20000:]) for p in Path('build').glob('*.log')]"
+        run: python -c "from pathlib import Path; [print(str(p)+'\n'+p.read_text(errors='replace')[-20000:]) for p in [*Path('build').glob('*.log'), *Path('build').rglob('识别引擎记录.txt')]]"
   publish:
     needs: [draft, build]
     runs-on: ubuntu-24.04

@@ -55,7 +55,7 @@ def build():
     asset=assets[0]
     assert asset.stat().st_size<2*1024**3,'GitHub assets must be under 2 GiB'
     with asset.open('rb') as stream:digest=hashlib.file_digest(stream,'sha256').hexdigest()
-    asset.with_suffix(asset.suffix+'.sha256').write_text(f'{digest}  {asset.name}\n')
+    asset.with_suffix(asset.suffix+'.sha256').write_bytes(f'{digest}  {asset.name}\n'.encode('ascii'))
 
 
 if __name__=='__main__':build()

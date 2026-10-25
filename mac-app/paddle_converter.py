@@ -24,6 +24,7 @@ import time
 import urllib.request
 
 PAGE_TIMEOUT = 90
+CPU_PAGE_TIMEOUT = 300
 PREPARATION_TIMEOUT = 60
 
 
@@ -158,6 +159,7 @@ class LocalOCR:
         self.process = None
         self.log = None
         self.parallelism = parallelism
+        self.use_gpu = sys.platform == 'darwin' and platform.machine() == 'arm64'
         self.limit_reason = None
         self.metrics = None
         self.start_lock = threading.Lock()
@@ -186,19 +188,28 @@ class LocalOCR:
     def command(self, port):
         engine = self.resources / 'paddle-engine'
         models = engine / 'models'
-        gpu = '99' if sys.platform == 'darwin' and platform.machine() == 'arm64' else '0'
-        return [str(engine / ('runtime/llama-b11814/llama-server' + ('.exe' if sys.platform == 'win32' else ''))),
+        gpu = '99' if self.use_gpu and sys.platform == 'darwin' and platform.machine() == 'arm64' else '0'
+        command = [str(engine / ('runtime/llama-b11814/llama-server' + ('.exe' if sys.platform == 'win32' else ''))),
                 '-m', str(models / 'PaddleOCR-VL-1.6-GGUF.gguf'),
                 '--mmproj', str(models / 'PaddleOCR-VL-1.6-GGUF-mmproj.gguf'),
                 '--host', '127.0.0.1', '--port', str(port), '-ngl', gpu,
                 '-c', str(16384*self.parallelism), '--parallel', str(self.parallelism), '--temp', '0']
+        if gpu == '0':command.append('--no-mmproj-offload')
+        return command
 
     def start(self):
         with socket.socket() as sock:
             sock.bind(('127.0.0.1', 0))
             port = sock.getsockname()[1]
         self.url = f'http://127.0.0.1:{port}'
-        self.log = (self.folder / '识别引擎记录.txt').open('a')
+        self.log = (self.folder / '识别引擎记录.txt').open('a', encoding='utf-8')
+        if self.use_gpu:
+            try:
+                devices = subprocess.check_output([self.command(port)[0], '--list-devices'], stderr=subprocess.STDOUT, text=True, timeout=15)
+                self.use_gpu = bool(re.search(r'^\s*MTL\d+:', devices, re.MULTILINE))
+                self.log.write(devices); self.log.flush()
+            except (OSError, subprocess.SubprocessError):
+                self.use_gpu = False
         baseline = resource_sample()
         self.initial_swap = baseline['swap_bytes'] if baseline else None
         if self.stopped.is_set():
@@ -219,6 +230,11 @@ class LocalOCR:
                 self.process.wait(timeout=10)
                 raise OSError('识别引擎已停止。')
             if self.process.poll() is not None:
+                if self.use_gpu and not self.limit_reason:
+                    self.use_gpu = False
+                    self.log.write('GPU 启动失败，自动尝试 CPU。\n'); self.log.flush()
+                    self.process = subprocess.Popen(self.command(port), stdout=self.log, stderr=subprocess.STDOUT, env=environment)
+                    continue
                 if self.limit_reason:
                     raise OSError(self.limit_reason)
                 raise RuntimeError('识别引擎启动失败，请查看识别引擎记录。')
@@ -249,7 +265,8 @@ class LocalOCR:
             {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + encoded}},
         ]}], 'repeat_penalty': 1.1, 'temperature': 0, 'max_tokens': 8192, 'stream': True}
         endpoint = urlsplit(self.url)
-        connection = http.client.HTTPConnection(endpoint.hostname, endpoint.port, timeout=PAGE_TIMEOUT)
+        timeout = PAGE_TIMEOUT if self.use_gpu else CPU_PAGE_TIMEOUT
+        connection = http.client.HTTPConnection(endpoint.hostname, endpoint.port, timeout=timeout)
         expired = threading.Event()
         transport = None
         def cancel_request():
@@ -260,7 +277,7 @@ class LocalOCR:
                     target.shutdown(socket.SHUT_RDWR)
                 except OSError:
                     pass
-        timer = threading.Timer(PAGE_TIMEOUT, cancel_request)
+        timer = threading.Timer(timeout, cancel_request)
         timer.daemon = True
         timer.start()
         try:

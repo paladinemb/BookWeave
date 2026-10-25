@@ -57,7 +57,7 @@ class ParallelConversionTest(unittest.TestCase):
             ocr=c.LocalOCR(ROOT,root);ocr.url=f'http://127.0.0.1:{server.server_port}'
             ocr.process=SimpleNamespace(poll=lambda:None)
             started=time.monotonic()
-            with patch.object(c,'PAGE_TIMEOUT',1.5),ThreadPoolExecutor(max_workers=2) as executor:
+            with patch.object(c,'PAGE_TIMEOUT',1.5),patch.object(c,'CPU_PAGE_TIMEOUT',1.5),ThreadPoolExecutor(max_workers=2) as executor:
                 slow=executor.submit(ocr.read,root/'slow.png')
                 self.assertTrue(server.slow_started.wait(3))
                 time.sleep(1.3)

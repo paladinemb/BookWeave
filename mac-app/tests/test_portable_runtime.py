@@ -4,7 +4,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
@@ -51,3 +51,24 @@ class PortableRuntimeTest(unittest.TestCase):
             with patch.object(c.sys,'platform','win32'),patch.object(Path,'replace',autospec=True,side_effect=replace_after_reader_closed):
                 c.atomic_json(target,{'status':'转换中'})
             self.assertEqual(json.loads(target.read_text(encoding='utf-8')),{'status':'转换中'})
+
+    def test_mac_without_a_metal_device_starts_cpu_engine(self):
+        with tempfile.TemporaryDirectory() as d,patch.object(c.sys,'platform','darwin'),patch.object(c.platform,'machine',return_value='arm64'):
+            ocr=c.LocalOCR(Path(d),Path(d));server=MagicMock();server.poll.return_value=None
+            response=MagicMock();response.__enter__.return_value.status=200
+            with patch.object(c,'resource_sample',return_value=None),patch.object(c.socket,'socket'),patch.object(c.threading,'Thread'),patch.object(c.subprocess,'check_output',return_value='Available devices:\n BLAS: Accelerate'),patch.object(c.subprocess,'Popen',return_value=server) as launch,patch.object(c.urllib.request,'urlopen',return_value=response):
+                ocr.start();ocr.close()
+            args=launch.call_args.args[0]
+            self.assertEqual(args[args.index('-ngl')+1],'0')
+            self.assertIn('--no-mmproj-offload',args)
+
+    def test_failed_metal_startup_retries_once_on_cpu(self):
+        with tempfile.TemporaryDirectory() as d,patch.object(c.sys,'platform','darwin'),patch.object(c.platform,'machine',return_value='arm64'):
+            ocr=c.LocalOCR(Path(d),Path(d));gpu=MagicMock();gpu.poll.return_value=1
+            cpu=MagicMock();cpu.poll.return_value=None
+            response=MagicMock();response.__enter__.return_value.status=200
+            with patch.object(c,'resource_sample',return_value=None),patch.object(c.socket,'socket'),patch.object(c.threading,'Thread'),patch.object(c.subprocess,'check_output',return_value='Available devices:\n MTL0: GPU'),patch.object(c.subprocess,'Popen',side_effect=[gpu,cpu]) as launch,patch.object(c.urllib.request,'urlopen',return_value=response):
+                ocr.start();ocr.close()
+            self.assertEqual(launch.call_count,2)
+            args=launch.call_args.args[0]
+            self.assertEqual(args[args.index('-ngl')+1],'0')

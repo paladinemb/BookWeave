@@ -8,6 +8,7 @@ on:
       - .github/workflows/release.yml
 env:
   PYTHONUTF8: '1'
+  PYTHONDONTWRITEBYTECODE: '1'
 permissions:
   contents: read
 concurrency:

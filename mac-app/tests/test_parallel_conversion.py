@@ -24,7 +24,8 @@ class StreamHandler(BaseHTTPRequestHandler):
         image=base64.b64decode(body['messages'][0]['content'][1]['image_url']['url'].split(',')[1])
         self.send_response(200);self.send_header('Content-Type','text/event-stream');self.end_headers()
         try:
-            time.sleep(.5 if image==b'slow' else .16)
+            if image==b'slow':self.server.slow_started.set()
+            time.sleep(3 if image==b'slow' else .3)
             event={'choices':[{'delta':{'content':'English 中文'},'finish_reason':'stop'}]}
             self.wfile.write(('data: '+json.dumps(event)+'\n\ndata: [DONE]\n\n').encode());self.wfile.flush()
         except (BrokenPipeError,ConnectionResetError): pass
@@ -33,6 +34,7 @@ class StreamHandler(BaseHTTPRequestHandler):
 @contextmanager
 def stream_server():
     server=ThreadingHTTPServer(('127.0.0.1',0),StreamHandler)
+    server.slow_started=threading.Event()
     thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
     try:yield server
     finally:server.shutdown();server.server_close();thread.join()
@@ -55,13 +57,14 @@ class ParallelConversionTest(unittest.TestCase):
             ocr=c.LocalOCR(ROOT,root);ocr.url=f'http://127.0.0.1:{server.server_port}'
             ocr.process=SimpleNamespace(poll=lambda:None)
             started=time.monotonic()
-            with patch.object(c,'PAGE_TIMEOUT',.25),ThreadPoolExecutor(max_workers=2) as executor:
+            with patch.object(c,'PAGE_TIMEOUT',1.5),ThreadPoolExecutor(max_workers=2) as executor:
                 slow=executor.submit(ocr.read,root/'slow.png')
-                time.sleep(.15)
+                self.assertTrue(server.slow_started.wait(3))
+                time.sleep(1.3)
                 fast=executor.submit(ocr.read,root/'fast.png')
                 with self.assertRaisesRegex(TimeoutError,'超时'):slow.result()
                 self.assertEqual(fast.result(),'English 中文')
-            self.assertLess(time.monotonic()-started,.5)
+            self.assertLess(time.monotonic()-started,2.8)
 
     def test_out_of_order_completion_is_cached_and_epub_stays_in_pdf_order(self):
         self.assertTrue(callable(getattr(c,'preferred_parallelism',None)), 'Parallel scheduling missing')
@@ -73,10 +76,11 @@ class ParallelConversionTest(unittest.TestCase):
                 n=int(image.stem.split('-')[1])
                 with lock:active+=1;peak=max(peak,active)
                 try:
-                    time.sleep(.4 if n==1 else .05)
                     if n==1:
-                        cached=list((root/'cache').glob('*/page-results/00152.json'))
-                        self.assertEqual(len(cached),1,'Later completed page must be cached before page 1 finishes')
+                        deadline=time.monotonic()+15
+                        while not list((root/'cache').glob('*/page-results/00152.json')) and time.monotonic()<deadline:time.sleep(.02)
+                        self.assertEqual(len(list((root/'cache').glob('*/page-results/00152.json'))),1,'Later completed page must be cached before page 1 finishes')
+                    else:time.sleep(.05)
                     return f'PAGE_{n}_TEXT'
                 finally:
                     with lock:active-=1

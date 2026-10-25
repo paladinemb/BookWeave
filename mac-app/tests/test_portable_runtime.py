@@ -1,4 +1,5 @@
 import os
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -38,3 +39,15 @@ class PortableRuntimeTest(unittest.TestCase):
         with patch.object(c.sys,'platform','linux'):
             self.assertEqual(Path(ocr.command(4567)[0]),Path('/resources/paddle-engine/runtime/llama-b11814/llama-server'))
             self.assertEqual(ocr.command(4567)[ocr.command(4567).index('--parallel')+1],'2')
+
+    def test_windows_progress_write_retries_a_temporary_reader_lock(self):
+        with tempfile.TemporaryDirectory() as d:
+            target=Path(d)/'state.json';target.write_text('{}')
+            replace=Path.replace;attempts=[]
+            def replace_after_reader_closed(path,destination):
+                attempts.append(1)
+                if len(attempts)==1:raise PermissionError(13,'File temporarily open by progress reader')
+                return replace(path,destination)
+            with patch.object(c.sys,'platform','win32'),patch.object(Path,'replace',autospec=True,side_effect=replace_after_reader_closed):
+                c.atomic_json(target,{'status':'转换中'})
+            self.assertEqual(json.loads(target.read_text(encoding='utf-8')),{'status':'转换中'})

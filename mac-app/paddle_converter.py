@@ -481,7 +481,14 @@ CACHE_VERSION = 'paddleocr-vl-1.6-b11814-clean-300dpi-v2'
 def atomic_json(path, value):
     temporary = path.with_suffix('.tmp')
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
-    temporary.replace(path)
+    for attempt in range(20):
+        try:
+            temporary.replace(path)
+            return
+        except PermissionError:
+            if sys.platform != 'win32' or attempt == 19:
+                raise
+            time.sleep(.05)
 
 
 def page_markdown(index, result):
